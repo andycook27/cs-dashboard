@@ -71,7 +71,9 @@ async function mpCall(endpoint, params, retries = 3) {
 }
 
 function domainRegex(domain) {
-  return `properties["$email"] =~ "(?i)@${domain.replace(/\./g, "\\\\.")}$"`;
+  // Single escape the dot — Mixpanel regex needs \. not \\.
+  const escaped = domain.replace(/\./g, "\\.");
+  return `properties["$email"] =~ "(?i)@${escaped}$"`;
 }
 
 // Fetch all data for a single domain sequentially to avoid rate limits

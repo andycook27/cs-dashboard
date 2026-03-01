@@ -18,55 +18,61 @@ export default async function handler(req, res) {
     });
   }
 
-  const baseUrls = {
-    engage:       "https://mixpanel.com/api/2.0/engage",
-    segmentation: "https://mixpanel.com/api/2.0/segmentation",
-    export:       "https://data.mixpanel.com/api/2.0/export",
-  };
-
-  const base = baseUrls[endpoint];
-  if (!base) return res.status(400).json({ error: "Unknown endpoint: " + endpoint });
-
-  // Build params — export does NOT use project_id as query param, uses auth only
-  const allParams = endpoint === "export"
-    ? { ...params }
-    : { ...params, project_id: projectId };
-
-  // Remove limit from export params — not supported
-  if (endpoint === "export") delete allParams.limit;
-
-  const qs  = new URLSearchParams(allParams).toString();
-  const url = base + "?" + qs;
+  const auth = Buffer.from(username + ":" + password).toString("base64");
 
   try {
-    const auth  = Buffer.from(username + ":" + password).toString("base64");
-    const mpRes = await fetch(url, {
-      headers: {
-        Authorization: "Basic " + auth,
-        Accept: "application/json",
-        // export endpoint needs project id in header
-        ...(endpoint === "export" ? { "X-Mixpanel-Project-Id": projectId } : {}),
-      },
-    });
+    let url, fetchOptions;
 
-    const text = await mpRes.text();
-    console.log("Mixpanel", endpoint, "status:", mpRes.status, "| preview:", text.slice(0, 200));
+    if (endpoint === "export") {
+      // Export API uses a completely different base URL and auth approach
+      // project_id must be in the query string, no special headers needed
+      const exportParams = { ...params, project_id: projectId };
+      const qs = new URLSearchParams(exportParams).toString();
+      url = "https://data.mixpanel.com/api/2.0/export?" + qs;
+      fetchOptions = {
+        headers: {
+          Authorization: "Basic " + auth,
+          Accept: "text/plain",
+        },
+      };
+    } else if (endpoint === "segmentation") {
+      const segParams = { ...params, project_id: projectId };
+      const qs = new URLSearchParams(segParams).toString();
+      url = "https://mixpanel.com/api/2.0/segmentation?" + qs;
+      fetchOptions = {
+        headers: {
+          Authorization: "Basic " + auth,
+          Accept: "application/json",
+        },
+      };
+    } else {
+      return res.status(400).json({ error: "Unknown endpoint: " + endpoint });
+    }
+
+    console.log("Calling:", endpoint, url.substring(0, 120));
+
+    const mpRes = await fetch(url, fetchOptions);
+    const text  = await mpRes.text();
+
+    console.log("Mixpanel", endpoint, "status:", mpRes.status, "| preview:", text.slice(0, 300));
 
     if (!mpRes.ok) {
       return res.status(mpRes.status).json({
         error: "Mixpanel API error",
         status: mpRes.status,
-        body: text.slice(0, 500),
+        body:   text.slice(0, 500),
       });
     }
 
     if (endpoint === "export") {
       const lines  = text.trim().split("\n").filter(Boolean);
       const parsed = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+      console.log("Export parsed", parsed.length, "events");
       return res.status(200).json({ results: parsed });
     }
 
     return res.status(200).json(JSON.parse(text));
+
   } catch (err) {
     console.error("Proxy error:", err.message);
     return res.status(500).json({ error: err.message });
