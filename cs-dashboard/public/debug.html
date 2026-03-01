@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Mixpanel API Debug</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #0a0a0a; color: #d1d5db; font-family: monospace; padding: 24px; }
+    h1 { color: #B5DF07; font-size: 18px; margin-bottom: 4px; }
+    p.sub { color: #6b7280; font-size: 12px; margin-bottom: 24px; }
+    .card { background: #111; border: 1px solid #222; border-radius: 10px; padding: 20px; margin-bottom: 16px; }
+    .card h2 { font-size: 13px; color: #B5DF07; margin-bottom: 12px; text-transform: uppercase; letter-spacing: .05em; }
+    label { font-size: 11px; color: #6b7280; display: block; margin-bottom: 4px; margin-top: 10px; }
+    input, select { width: 100%; background: #1a1a1a; border: 1px solid #2a2a2a; color: #fff; padding: 7px 10px; border-radius: 6px; font-size: 12px; font-family: monospace; }
+    button { margin-top: 14px; padding: 8px 20px; background: #B5DF07; color: #000; border: none; border-radius: 6px; font-size: 12px; font-weight: bold; cursor: pointer; }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    .result { margin-top: 14px; background: #0d0d0d; border: 1px solid #1a1a1a; border-radius: 6px; padding: 12px; font-size: 11px; line-height: 1.7; max-height: 360px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; }
+    .ok   { color: #4ade80; }
+    .err  { color: #f87171; }
+    .warn { color: #facc15; }
+    .dim  { color: #4b5563; }
+    .row  { display: flex; gap: 10px; }
+    .row > div { flex: 1; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 99px; font-size: 10px; font-weight: bold; margin-left: 8px; }
+    .badge.ok  { background: #4ade8020; color: #4ade80; border: 1px solid #4ade8040; }
+    .badge.err { background: #f8717120; color: #f87171; border: 1px solid #f8717140; }
+    .badge.run { background: #B5DF0720; color: #B5DF07; border: 1px solid #B5DF0740; }
+  </style>
+</head>
+<body>
+
+<h1>🔬 Mixpanel API Debug</h1>
+<p class="sub">Tests each layer of the API independently so you can pinpoint exactly where things break.</p>
+
+<!-- ── Test 1: Env Vars ── -->
+<div class="card">
+  <h2>Test 1 — Env Vars <span id="b1" class="badge"></span></h2>
+  <p style="font-size:11px;color:#6b7280">Checks that MIXPANEL_SERVICE_ACCOUNT_USER, SECRET, and PROJECT_ID are set.</p>
+  <button onclick="testEnv()">Run</button>
+  <div id="r1" class="result dim">Not run yet.</div>
+</div>
+
+<!-- ── Test 2: Engage ── -->
+<div class="card">
+  <h2>Test 2 — Engage API <span id="b2" class="badge"></span></h2>
+  <label>Domain</label>
+  <input id="engageDomain" value="sitemarker.com" />
+  <button onclick="testEngage()">Run</button>
+  <div id="r2" class="result dim">Not run yet.</div>
+</div>
+
+<!-- ── Test 3: Export probe (no filter) ── -->
+<div class="card">
+  <h2>Test 3 — Export API (no where filter) <span id="b3" class="badge"></span></h2>
+  <p style="font-size:11px;color:#6b7280;margin-bottom:8px">Confirms auth + dates + event names work before adding any user filter.</p>
+  <div class="row">
+    <div><label>From Date</label><input id="fromDate" type="date" /></div>
+    <div><label>To Date</label><input id="toDate" type="date" /></div>
+  </div>
+  <label>Event Name (single, exact)</label>
+  <input id="exportEvent" value="User Signed In" />
+  <button onclick="testExportProbe()">Run</button>
+  <div id="r3" class="result dim">Not run yet.</div>
+</div>
+
+<!-- ── Test 4: Export with distinct_id filter ── -->
+<div class="card">
+  <h2>Test 4 — Export with distinct_id filter <span id="b4" class="badge"></span></h2>
+  <p style="font-size:11px;color:#6b7280;margin-bottom:8px">Tests both <code>distinct_id == "x"</code> syntaxes with a single known ID from Test 2.</p>
+  <label>distinct_id (paste one from Test 2 results)</label>
+  <input id="testDistinctId" placeholder="e.g. ff037e385e5c0401d971" />
+  <label>Event Name</label>
+  <input id="exportEvent2" value="User Signed In" />
+  <div class="row">
+    <div><label>From</label><input id="fromDate2" type="date" /></div>
+    <div><label>To</label><input id="toDate2" type="date" /></div>
+  </div>
+  <button onclick="testExportWithId()">Run</button>
+  <div id="r4" class="result dim">Not run yet.</div>
+</div>
+
+<!-- ── Test 5: Full flow ── -->
+<div class="card">
+  <h2>Test 5 — Full Flow (Engage → Export) <span id="b5" class="badge"></span></h2>
+  <p style="font-size:11px;color:#6b7280;margin-bottom:8px">Runs the exact same flow as the dashboard — Engage to get IDs, then batched Export.</p>
+  <label>Domain</label>
+  <input id="fullDomain" value="sitemarker.com" />
+  <button onclick="testFullFlow()">Run</button>
+  <div id="r5" class="result dim">Not run yet.</div>
+</div>
+
+<script>
+  // Set default dates
+  const today = new Date().toISOString().slice(0,10);
+  const ago30 = new Date(Date.now() - 30*86400000).toISOString().slice(0,10);
+  document.getElementById("fromDate").value  = ago30;
+  document.getElementById("toDate").value    = today;
+  document.getElementById("fromDate2").value = ago30;
+  document.getElementById("toDate2").value   = today;
+
+  const KEY_EVENTS = [
+    "User Signed In","Project Created","Report Created","Report Draft Published",
+    "Pin Created","Pin Saved","Share Sent","Map Layer Created","Pin Updated"
+  ];
+
+  function set(id, html, cls) {
+    const el = document.getElementById(id);
+    el.innerHTML = html;
+    el.className = "result " + (cls || "");
+  }
+  function badge(id, text, cls) {
+    const el = document.getElementById(id);
+    el.textContent = text;
+    el.className = "badge " + cls;
+  }
+  function fmt(obj) { return JSON.stringify(obj, null, 2); }
+
+  async function apiCall(endpoint, params) {
+    const res  = await fetch("/api/mixpanel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ endpoint, params })
+    });
+    const text = await res.text();
+    let data;
+    try { data = JSON.parse(text); } catch { data = { raw: text }; }
+    return { ok: res.ok, status: res.status, data };
+  }
+
+  // ── Test 1 ────────────────────────────────────────────────────────────────
+  async function testEnv() {
+    badge("b1","running","run"); set("r1","Checking env vars...");
+    try {
+      const res = await fetch("/api/mixpanel");
+      const d   = await res.json();
+      const ok  = d.hasUser && d.hasSecret && d.hasProjectId;
+      badge("b1", ok ? "pass" : "fail", ok ? "ok" : "err");
+      set("r1",
+        `Status: ${res.status}\n\n` +
+        `MIXPANEL_SERVICE_ACCOUNT_USER:   ${d.hasUser    ? "✓ set" : "✗ MISSING"}\n` +
+        `MIXPANEL_SERVICE_ACCOUNT_SECRET: ${d.hasSecret  ? "✓ set" : "✗ MISSING"}\n` +
+        `MIXPANEL_PROJECT_ID:             ${d.hasProjectId ? "✓ set" : "✗ MISSING"}`,
+        ok ? "ok" : "err"
+      );
+    } catch(e) { badge("b1","error","err"); set("r1","Error: "+e.message,"err"); }
+  }
+
+  // ── Test 2 ────────────────────────────────────────────────────────────────
+  async function testEngage() {
+    const domain = document.getElementById("engageDomain").value.trim();
+    badge("b2","running","run"); set("r2","Querying Engage for @"+domain+"...");
+    try {
+      const { ok, status, data } = await apiCall("engage", { domain: [domain] });
+      const profiles = data.results || [];
+      const sample   = profiles.slice(0,3).map(p => ({
+        id:    p.$distinct_id,
+        email: p.$properties?.$email || p.$properties?.email || "—",
+        name:  p.$properties?.$name  || "—",
+      }));
+      badge("b2", ok ? "pass" : "fail", ok ? "ok" : "err");
+      set("r2",
+        `Status: ${status}  |  Profiles returned: ${data.total ?? profiles.length}\n\n` +
+        `First 3 profiles:\n${fmt(sample)}\n\n` +
+        `→ Copy a distinct_id above into Test 4`,
+        ok ? "ok" : "err"
+      );
+    } catch(e) { badge("b2","error","err"); set("r2","Error: "+e.message,"err"); }
+  }
+
+  // ── Test 3 ────────────────────────────────────────────────────────────────
+  async function testExportProbe() {
+    const from  = document.getElementById("fromDate").value;
+    const to    = document.getElementById("toDate").value;
+    badge("b3","running","run"); set("r3","Probing Export with NO event filter — fetching all event names...");
+    try {
+      // No event filter = returns ALL events, lets us see actual event names
+      const { ok, status, data } = await apiCall("export", {
+        from_date: from, to_date: to,
+      });
+      const count = data.results?.length ?? 0;
+      badge("b3", ok ? "pass" : "fail", ok ? "ok" : "err");
+      if (!ok) {
+        set("r3", `Status: ${status}\n\nError: ${fmt(data)}`, "err");
+      } else if (count === 0) {
+        set("r3",
+          `Status: ${status}  |  Events returned: 0\n\n` +
+          `⚠ No events at all in this date range for this project.\n` +
+          `Try widening the date range.`,
+          "warn"
+        );
+        badge("b3","warn","run");
+      } else {
+        // Dedupe and count all unique event names
+        const nameMap = {};
+        data.results.forEach(e => { nameMap[e.event] = (nameMap[e.event]||0)+1; });
+        const sorted = Object.entries(nameMap).sort((a,b)=>b[1]-a[1]);
+
+        const KEY_EVENTS = [
+          "User Signed In","Project Created","Report Created","Report Draft Published",
+          "Pin Created","Pin Saved","Share Sent","Map Layer Created","Pin Updated"
+        ];
+        const found    = KEY_EVENTS.filter(k => nameMap[k]);
+        const notFound = KEY_EVENTS.filter(k => !nameMap[k]);
+
+        set("r3",
+          `Status: ${status}  |  Total events: ${count}  |  Unique event names: ${sorted.length}\n\n` +
+          `KEY_EVENTS match check:\n` +
+          (found.length    ? found.map(k=>`  ✓  "${k}"`).join("\n")+"\n" : "") +
+          (notFound.length ? notFound.map(k=>`  ✗  "${k}"  ← NOT FOUND`).join("\n")+"\n" : "") +
+          `\nAll event names in your project (by frequency):\n` +
+          sorted.map(([k,v])=>`  ${String(v).padStart(5)}x  "${k}"`).join("\n"),
+          ok ? "ok" : "err"
+        );
+      }
+    } catch(e) { badge("b3","error","err"); set("r3","Error: "+e.message,"err"); }
+  }
+
+  // ── Test 4 ────────────────────────────────────────────────────────────────
+  async function testExportWithId() {
+    const id    = document.getElementById("testDistinctId").value.trim();
+    const from  = document.getElementById("fromDate2").value;
+    const to    = document.getElementById("toDate2").value;
+    const event = document.getElementById("exportEvent2").value.trim();
+    if (!id) { set("r4","Paste a distinct_id from Test 2 first.","warn"); return; }
+    badge("b4","running","run"); set("r4","Testing Export with distinct_id filter...\nID: "+id);
+    try {
+      const { ok, status, data } = await apiCall("export", {
+        from_date: from, to_date: to,
+        event: [event],
+        distinct_ids: [id],
+      });
+      const count = data.results?.length ?? 0;
+      badge("b4", ok ? "pass" : "fail", ok ? "ok" : "err");
+      if (!ok) {
+        set("r4", `Status: ${status}\n\nError body:\n${fmt(data)}`, "err");
+      } else {
+        set("r4",
+          `Status: ${status}  |  Events for this user: ${count}\n\n` +
+          (count > 0 ? `Sample:\n${fmt(data.results.slice(0,3))}` : "No events — try a wider date range or different event name."),
+          count > 0 ? "ok" : "warn"
+        );
+      }
+    } catch(e) { badge("b4","error","err"); set("r4","Error: "+e.message,"err"); }
+  }
+
+  // ── Test 5 ────────────────────────────────────────────────────────────────
+  async function testFullFlow() {
+    const domain = document.getElementById("fullDomain").value.trim();
+    badge("b5","running","run"); set("r5","Step 1/2 — Engage: fetching profiles for @"+domain+"...");
+    try {
+      const eng = await apiCall("engage", { domain: [domain] });
+      if (!eng.ok) { badge("b5","fail","err"); set("r5","Engage failed:\n"+fmt(eng.data),"err"); return; }
+      const profiles    = eng.data.results || [];
+      const distinctIds = profiles.map(p=>p.$distinct_id).filter(Boolean);
+      set("r5",
+        `✓ Engage: ${profiles.length} profiles, ${distinctIds.length} distinct_ids\n` +
+        `Step 2/2 — Export: fetching events for these users...`
+      );
+
+      const to90   = new Date().toISOString().slice(0,10);
+      const from90 = new Date(Date.now()-90*86400000).toISOString().slice(0,10);
+      const exp    = await apiCall("export", {
+        from_date: from90, to_date: to90,
+        event: KEY_EVENTS,
+        distinct_ids: distinctIds,
+      });
+
+      if (!exp.ok) { badge("b5","fail","err"); set("r5","Export failed:\n"+fmt(exp.data),"err"); return; }
+
+      const events = exp.data.results || [];
+      const recent = events.filter(e => e.properties?.time*1000 >= Date.now()-30*86400000);
+      const evMap  = {};
+      recent.forEach(e => { evMap[e.event] = (evMap[e.event]||0)+1; });
+      const top    = Object.entries(evMap).sort((a,b)=>b[1]-a[1]).slice(0,5);
+      const last   = events[0];
+
+      badge("b5","pass","ok");
+      set("r5",
+        `✓ Engage:  ${profiles.length} users\n` +
+        `✓ Export:  ${events.length} events (90d) | ${recent.length} events (30d)\n\n` +
+        `Last event:\n  ${last ? `${last.event} by ${last.distinct_id} at ${new Date(last.properties?.time*1000).toISOString()}` : "none"}\n\n` +
+        `Top events (30d):\n${top.map(([k,v])=>`  ${v.toString().padStart(4)}x  ${k}`).join("\n") || "  none"}`,
+        "ok"
+      );
+    } catch(e) { badge("b5","error","err"); set("r5","Error: "+e.message,"err"); }
+  }
+</script>
+</body>
+</html>
