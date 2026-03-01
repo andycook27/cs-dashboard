@@ -171,18 +171,14 @@ export default async function handler(req, res) {
       // Prefer domain filter when available — avoids the 50-user cap entirely
       let where = "";
 
-      if (domains?.length) {
-        // Export API uses has_suffix for string suffix matching (not like, not =~, not in)
-        // Wrapped in defined() guard to skip profiles with no email property
-        where = domains.map(d => `defined(properties["$email"]) and properties["$email"].has_suffix("@${d}")`).join(" or ");
-      } else if (distinct_ids?.length) {
-        // FIX: batch in groups of 200 to avoid URL length limits
-        // Export where clause has no documented hard limit but ~200 IDs is safe
-        const ids     = distinct_ids.slice(0, 200);
+      if (distinct_ids?.length) {
+        // Use distinct_ids from Engage — batch into chunks of 100 to stay within
+        // URL length limits. Export where clause: distinct_id == "x" or distinct_id == "y"
+        const ids     = distinct_ids.slice(0, 100);
         const clauses = ids.map(id => `distinct_id == "${id.replace(/"/g, '\\"')}"`).join(" or ");
         where         = `(${clauses})`;
-        if (distinct_ids.length > 200) {
-          console.warn("distinct_ids truncated from", distinct_ids.length, "to 200");
+        if (distinct_ids.length > 100) {
+          console.warn("distinct_ids truncated from", distinct_ids.length, "to 100 — consider paginating");
         }
       }
 

@@ -128,11 +128,14 @@ async function fetchDomainData(domains) {
 
   // FIX: Pass KEY_EVENTS as a raw array — proxy handles JSON.stringify
   // Previously this was double-serialized causing silent 0 event returns
+  // Use distinct_ids from Engage for the Export where clause.
+  // Domain-based string filtering is not reliably supported by the Export API.
+  // Engage already gave us the exact user list for these domains.
   const exportData = await mpCall("export", {
-    from_date: from90,
-    to_date:   to90,
-    event:     KEY_EVENTS,   // raw array, NOT JSON.stringify(KEY_EVENTS)
-    domains:   domains,      // proxy uses this for domain-based where clause
+    from_date:    from90,
+    to_date:      to90,
+    event:        KEY_EVENTS,   // raw array, proxy handles JSON.stringify
+    distinct_ids: distinctIds,  // from Engage results above
   });
 
   const events = (exportData.results || [])
