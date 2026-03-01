@@ -10,10 +10,13 @@ const STATUS_COLORS = {
   "Blocked":     "bg-red-800 text-red-100",
 };
 const BG0 = "#0a0a0a", BG1 = "#111111", BG2 = "#1a1a1a", BG3 = "#2a2a2a", BRD = "#222222";
+const COOLDOWN_MS = 30 * 60 * 1000; // 30 min between syncs
+const CACHE_KEY   = "mp_cache_v1";
 
 const KEY_EVENTS = [
-  "User Signed In","Project Created","Report Created","Report Draft Published",
-  "Pin Created","Pin Saved","Share Sent","Map Layer Created","Pin Updated",
+  "User Signed In", "Project Created", "Report Created",
+  "Report Draft Published", "Pin Created", "Pin Saved",
+  "Share Sent", "Map Layer Created", "Pin Updated",
 ];
 
 const DEFAULT_CLIENTS = [
@@ -27,30 +30,51 @@ const TIER_BADGE = {
   Starter:    "bg-gray-800 text-gray-400 border border-gray-700",
 };
 
-function getHealth(daysAgo) {
-  if (daysAgo === null || daysAgo === undefined) return "Inactive";
-  if (daysAgo <= 30) return "Healthy";
-  if (daysAgo <= 90) return "At Risk";
+function getHealth(d) {
+  if (d === null || d === undefined) return "Inactive";
+  if (d <= 30) return "Healthy";
+  if (d <= 90) return "At Risk";
   return "Inactive";
 }
 function healthColor(h) {
-  if (h === "Healthy")  return BRAND;
-  if (h === "At Risk")  return "#facc15";
+  if (h === "Healthy") return BRAND;
+  if (h === "At Risk") return "#facc15";
   return "#f87171";
 }
 function daysSince(dateStr) {
   if (!dateStr) return null;
-  const diff = Date.now() - new Date(dateStr).getTime();
-  return Math.floor(diff / 86400000);
+  return Math.floor((Date.now() - new Date(dateStr).getTime()) / 86400000);
 }
 function fmt(dateStr) {
   if (!dateStr) return "—";
   return new Date(dateStr).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
 }
+function timeAgo(ts) {
+  if (!ts) return null;
+  const mins = Math.floor((Date.now() - ts) / 60000);
+  if (mins < 1)  return "just now";
+  if (mins < 60) return mins + "m ago";
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24)  return hrs + "h ago";
+  return Math.floor(hrs / 24) + "d ago";
+}
 
-// ── Mixpanel API helper ──────────────────────────────────────────────────────
-const sleep = ms => new Promise(r => setTimeout(r, ms));
+// ── Cache helpers (in-memory only) ──────────────────────────────────────────
+let memCache = null;
+function loadCache() {
+  if (memCache) return memCache;
+  try {
+    const raw = sessionStorage.getItem(CACHE_KEY);
+    if (raw) { memCache = JSON.parse(raw); return memCache; }
+  } catch {}
+  return null;
+}
+function saveCache(data) {
+  memCache = data;
+  try { sessionStorage.setItem(CACHE_KEY, JSON.stringify(data)); } catch {}
+}
 
+// ── Mixpanel API ─────────────────────────────────────────────────────────────
 async function mpCall(endpoint, params) {
   const res = await fetch("/api/mixpanel", {
     method: "POST",
@@ -58,97 +82,70 @@ async function mpCall(endpoint, params) {
     body: JSON.stringify({ endpoint, params }),
   });
   const data = await res.json();
-  if (!res.ok) throw new Error(data.error || "Proxy error " + res.status);
+  if (!res.ok) throw new Error(data.error || data.body || "API error " + res.status);
   return data;
 }
 
-// Step 1: get all distinct_ids for a domain via Engage (user profiles)
-async function fetchDistinctIds(domain) {
-  try {
-    const data = await mpCall("engage", { domain });
-    const profiles = data.results || [];
-    console.log("Profiles found for", domain, ":", profiles.length);
-    return profiles.map(p => p.$distinct_id).filter(Boolean);
-  } catch (e) {
-    console.warn("engage failed:", e.message);
-    return [];
-  }
-}
+// Single optimized fetch per domain — only 2 API calls:
+// 1. Engage → get distinct_ids for the domain
+// 2. Export → get all key events for those users in one shot
+async function fetchDomainData(domain) {
+  // ── Call 1: Engage API — get user profiles ──
+  const engageData = await mpCall("engage", { domain });
+  const profiles   = engageData.results || [];
 
-// Step 2: fetch all data using distinct_ids
-async function fetchAllForDomain(domain) {
-  const to90   = new Date().toISOString().slice(0, 10);
-  const from90 = new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10);
-  const from30 = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
-  const fromMTD = new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString().slice(0, 10);
-
-  // Get distinct_ids for this domain
-  const distinctIds = await fetchDistinctIds(domain);
-  if (!distinctIds.length) {
-    console.warn("No users found for domain:", domain);
+  if (!profiles.length) {
     return { lastEvent: "No users found", lastUser: "—", lastDate: null, daysAgo: null, eventCount: 0, topEvent: "—", newUsers: 0 };
   }
-  console.log("Found", distinctIds.length, "users for", domain);
 
-  // 1. Last event via export filtered by distinct_ids
-  let lastEventData = null;
-  try {
-    await sleep(300);
-    const exportData = await mpCall("export", {
-      from_date:    from90,
-      to_date:      to90,
-      event:        JSON.stringify(KEY_EVENTS),
-      distinct_ids: distinctIds,
-    });
-    const events = (exportData.results || []).sort((a, b) => b.properties.time - a.properties.time);
-    if (events.length) {
-      const e = events[0];
-      const d = new Date(e.properties.time * 1000).toISOString().slice(0, 10);
-      // Look up the user's email from profiles
-      lastEventData = {
-        lastEvent: e.event,
-        lastUser:  e.properties["$email"] || e.properties.email || e.distinct_id || "—",
-        lastDate:  d,
-        daysAgo:   daysSince(d),
-      };
-    }
-  } catch (e) { console.warn("export failed:", e.message); }
+  const distinctIds = profiles.map(p => p.$distinct_id).filter(Boolean);
 
-  // 2. Event count — count all key events in export results
-  let eventCount = 0;
-  let topEventMap = {};
-  try {
-    await sleep(300);
-    const exportData = await mpCall("export", {
-      from_date:    from30,
-      to_date:      to90,
-      event:        JSON.stringify(KEY_EVENTS),
-      distinct_ids: distinctIds,
-    });
-    const events = exportData.results || [];
-    eventCount = events.length;
-    events.forEach(e => { topEventMap[e.event] = (topEventMap[e.event] || 0) + 1; });
-  } catch (e) { console.warn("eventCount failed:", e.message); }
+  // Count new users this month from profile $created date
+  const mtdStart = new Date(new Date().getFullYear(), new Date().getMonth(), 1).getTime();
+  const newUsers  = profiles.filter(p => {
+    const created = p.$properties?.$created || p.$properties?.created;
+    return created && new Date(created).getTime() >= mtdStart;
+  }).length;
 
-  // 3. Top event from the count above
-  const topEvent = Object.entries(topEventMap).sort((a, b) => b[1] - a[1])[0]?.[0] || "—";
+  // ── Call 2: Export API — get events for these users ──
+  const to90   = new Date().toISOString().slice(0, 10);
+  const from90 = new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10);
 
-  // 4. New users — count profiles created this month
-  let newUsers = 0;
-  try {
-    const mtdProfiles = await mpCall("engage", { domain });
-    const mtdStart = new Date(fromMTD).getTime();
-    newUsers = (mtdProfiles.results || []).filter(p => {
-      const created = p.$properties?.$created;
-      return created && new Date(created).getTime() >= mtdStart;
-    }).length;
-  } catch (e) { console.warn("newUsers failed:", e.message); }
+  const exportData = await mpCall("export", {
+    from_date:    from90,
+    to_date:      to90,
+    event:        JSON.stringify(KEY_EVENTS),
+    distinct_ids: distinctIds,
+  });
+
+  const events = (exportData.results || []).sort((a, b) => b.properties.time - a.properties.time);
+
+  // Last event
+  let lastEvent = null;
+  if (events.length) {
+    const e = events[0];
+    const d = new Date(e.properties.time * 1000).toISOString().slice(0, 10);
+    // Look up email from profile
+    const profile = profiles.find(p => p.$distinct_id === e.distinct_id);
+    const email   = profile?.$properties?.$email || profile?.$properties?.email || e.distinct_id;
+    lastEvent = { lastEvent: e.event, lastUser: email, lastDate: d, daysAgo: daysSince(d) };
+  }
+
+  // Event count (last 30 days)
+  const from30ts  = Date.now() - 30 * 86400000;
+  const recent    = events.filter(e => e.properties.time * 1000 >= from30ts);
+  const eventCount = recent.length;
+
+  // Top event (last 30 days)
+  const eventMap = {};
+  recent.forEach(e => { eventMap[e.event] = (eventMap[e.event] || 0) + 1; });
+  const topEvent = Object.entries(eventMap).sort((a, b) => b[1] - a[1])[0]?.[0] || "—";
 
   return {
-    lastEvent:  lastEventData?.lastEvent || "No recent activity",
-    lastUser:   lastEventData?.lastUser  || "—",
-    lastDate:   lastEventData?.lastDate  || null,
-    daysAgo:    lastEventData?.daysAgo   ?? null,
+    lastEvent:  lastEvent?.lastEvent || "No recent activity",
+    lastUser:   lastEvent?.lastUser  || "—",
+    lastDate:   lastEvent?.lastDate  || null,
+    daysAgo:    lastEvent?.daysAgo   ?? null,
     eventCount,
     topEvent,
     newUsers,
@@ -175,9 +172,7 @@ function Logo() {
 
 function Spinner() {
   return (
-    <div className="flex items-center justify-center py-12">
-      <div className="w-8 h-8 border-2 border-gray-600 rounded-full animate-spin" style={{ borderTopColor: BRAND }} />
-    </div>
+    <div className="w-4 h-4 border-2 border-black/30 rounded-full animate-spin" style={{ borderTopColor: "#000" }} />
   );
 }
 
@@ -185,45 +180,62 @@ const inputStyle = { backgroundColor: BG2, border: "1px solid " + BG3, color: "w
 
 // ── Main App ─────────────────────────────────────────────────────────────────
 export default function App() {
-  const [clients, setClients]         = useState(DEFAULT_CLIENTS);
-  const [mpData, setMpData]           = useState({});
-  const [loading, setLoading]         = useState(false);
-  const [loadingMsg, setLoadingMsg]   = useState("");
-  const [selected, setSelected]       = useState(null);
-  const [filter, setFilter]           = useState("All");
-  const [activeTab, setActiveTab]     = useState("overview");
-  const [todoModal, setTodoModal]     = useState(null);
+  const [clients, setClients]           = useState(DEFAULT_CLIENTS);
+  const [mpData, setMpData]             = useState({});
+  const [loading, setLoading]           = useState(false);
+  const [loadingMsg, setLoadingMsg]     = useState("");
+  const [lastSynced, setLastSynced]     = useState(null);
+  const [syncError, setSyncError]       = useState(null);
+  const [selected, setSelected]         = useState(null);
+  const [filter, setFilter]             = useState("All");
+  const [activeTab, setActiveTab]       = useState("overview");
+  const [todoModal, setTodoModal]       = useState(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [form, setForm]               = useState({ text: "", due: "", priority: "Medium", status: "To Do", notes: "" });
-
-  // Client editor state
   const [editingClients, setEditingClients] = useState(DEFAULT_CLIENTS);
+  const [form, setForm] = useState({ text: "", due: "", priority: "Medium", status: "To Do", notes: "" });
+
+  // Load cached data on mount
+  useEffect(() => {
+    const cache = loadCache();
+    if (cache) {
+      setMpData(cache.data || {});
+      setLastSynced(cache.ts || null);
+    }
+  }, []);
 
   const client   = selected !== null ? clients.find(c => c.id === selected) : null;
   const enriched = clients.map(c => ({ ...c, ...(mpData[c.id] || {}) }));
   const filtered = filter === "All" ? enriched : enriched.filter(c => getHealth(c.daysAgo) === filter);
 
-  // ── Load Mixpanel data for all clients ──
+  const canSync = !loading && (!lastSynced || Date.now() - lastSynced > COOLDOWN_MS);
+  const cooldownMins = lastSynced ? Math.max(0, Math.ceil((COOLDOWN_MS - (Date.now() - lastSynced)) / 60000)) : 0;
+
   const loadMixpanelData = useCallback(async () => {
+    if (!canSync) return;
     setLoading(true);
+    setSyncError(null);
     const result = {};
+
     for (const c of clients) {
-      setLoadingMsg("Loading " + c.name + "...");
+      setLoadingMsg("Syncing " + c.name + "...");
       try {
-        result[c.id] = await fetchAllForDomain(c.domain);
+        result[c.id] = await fetchDomainData(c.domain);
+        setMpData({ ...result }); // update progressively
       } catch (e) {
         console.error("Failed for", c.name, e.message);
-        result[c.id] = { lastEvent: "Error loading", lastUser: "—", lastDate: null, daysAgo: null, eventCount: 0, topEvent: "—", newUsers: 0 };
+        setSyncError("Error on " + c.name + ": " + e.message);
+        result[c.id] = { lastEvent: "Sync error", lastUser: "—", lastDate: null, daysAgo: null, eventCount: 0, topEvent: "—", newUsers: 0 };
       }
-      // Update UI after each client so results appear progressively
-      setMpData({ ...result });
     }
+
+    const ts = Date.now();
     setMpData(result);
+    setLastSynced(ts);
+    saveCache({ data: result, ts });
     setLoading(false);
     setLoadingMsg("");
-  }, [clients]);
+  }, [clients, canSync]);
 
-  // ── Todo helpers ──
   const openAdd  = id => { setForm({ text: "", due: "", priority: "Medium", status: "To Do", notes: "" }); setTodoModal({ clientId: id, todo: null }); };
   const openEdit = (id, todo) => { setForm({ ...todo }); setTodoModal({ clientId: id, todo }); };
   const saveTodo = () => {
@@ -270,24 +282,40 @@ export default function App() {
               </div>
             ))}
           </div>
-          <div className="flex gap-2 ml-2">
-            <button onClick={loadMixpanelData} disabled={loading}
-              className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-medium transition-all hover:opacity-90 disabled:opacity-50"
-              style={{ backgroundColor: BRAND, color: "#000" }}>
-              {loading ? "Loading..." : "↻ Sync Mixpanel"}
-            </button>
-            <button onClick={() => { setEditingClients(clients); setSettingsOpen(true); }}
-              className="px-3 py-2 rounded-lg text-xs font-medium text-gray-400 hover:text-white transition-colors"
-              style={{ backgroundColor: BG2, border: "1px solid " + BG3 }}>
-              ⚙ Clients
-            </button>
+          <div className="flex flex-col items-end gap-1 ml-2">
+            <div className="flex gap-2">
+              <button onClick={loadMixpanelData} disabled={!canSync}
+                className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-medium transition-all hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed"
+                style={{ backgroundColor: BRAND, color: "#000" }}>
+                {loading ? <><Spinner /> Syncing...</> : "↻ Sync Mixpanel"}
+              </button>
+              <button onClick={() => { setEditingClients(clients); setSettingsOpen(true); }}
+                className="px-3 py-2 rounded-lg text-xs font-medium text-gray-400 hover:text-white transition-colors"
+                style={{ backgroundColor: BG2, border: "1px solid " + BG3 }}>
+                ⚙ Clients
+              </button>
+            </div>
+            {lastSynced && (
+              <p className="text-[10px] text-gray-600">
+                Last synced {timeAgo(lastSynced)}
+                {!canSync && cooldownMins > 0 && <span className="text-gray-700"> · next sync in {cooldownMins}m</span>}
+              </p>
+            )}
           </div>
         </div>
       </div>
 
+      {/* Loading banner */}
       {loading && (
         <div className="px-6 py-2 text-xs text-center" style={{ backgroundColor: BRAND + "15", borderBottom: "1px solid " + BRAND + "30", color: BRAND }}>
           {loadingMsg}
+        </div>
+      )}
+
+      {/* Error banner */}
+      {syncError && !loading && (
+        <div className="px-6 py-2 text-xs text-center bg-red-900/20 border-b border-red-800/30 text-red-400">
+          {syncError} — check Vercel logs for details
         </div>
       )}
 
@@ -303,80 +331,69 @@ export default function App() {
             ))}
           </div>
 
-          {loading && !Object.keys(mpData).length ? <Spinner /> : (
-            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-              {filtered.map(c => {
-                const h        = getHealth(c.daysAgo);
-                const hcol     = healthColor(h);
-                const openCount = c.todos.filter(t => t.status !== "Done").length;
-                const nextTodo  = c.todos.find(t => t.status !== "Done");
-                return (
-                  <div key={c.id} onClick={() => { setSelected(c.id); setActiveTab("overview"); }}
-                    className="rounded-xl border cursor-pointer transition-all group"
-                    style={{ backgroundColor: BG1, borderColor: h === "Healthy" ? BRAND + "40" : h === "At Risk" ? "#facc1530" : "#f8717130" }}>
-                    <div className="p-4">
-                      {/* Name row */}
-                      <div className="flex items-start justify-between mb-3">
-                        <div>
-                          <div className="flex items-center gap-2">
-                            <h2 className="font-semibold text-white text-base group-hover:opacity-80 transition-opacity">{c.name}</h2>
-                            <span className={"text-[10px] px-1.5 py-0.5 rounded font-medium " + TIER_BADGE[c.tier]}>{c.tier}</span>
-                          </div>
-                          <div className="flex items-center gap-1.5 mt-1">
-                            <div className="w-2 h-2 rounded-full" style={{ backgroundColor: hcol }} />
-                            <span className="text-xs font-medium" style={{ color: hcol }}>{h}</span>
-                            <span className="text-[10px] text-gray-600">· {c.domain}</span>
-                          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+            {filtered.map(c => {
+              const h         = getHealth(c.daysAgo);
+              const hcol      = healthColor(h);
+              const openCount = c.todos.filter(t => t.status !== "Done").length;
+              const nextTodo  = c.todos.find(t => t.status !== "Done");
+              return (
+                <div key={c.id} onClick={() => { setSelected(c.id); setActiveTab("overview"); }}
+                  className="rounded-xl border cursor-pointer transition-all group"
+                  style={{ backgroundColor: BG1, borderColor: h === "Healthy" ? BRAND + "40" : h === "At Risk" ? "#facc1530" : "#f8717130" }}>
+                  <div className="p-4">
+                    <div className="flex items-start justify-between mb-3">
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <h2 className="font-semibold text-white text-base group-hover:opacity-80 transition-opacity">{c.name}</h2>
+                          <span className={"text-[10px] px-1.5 py-0.5 rounded font-medium " + TIER_BADGE[c.tier]}>{c.tier}</span>
                         </div>
-                        {openCount > 0 && (
-                          <div className="text-xs font-bold rounded-full w-5 h-5 flex items-center justify-center text-black" style={{ backgroundColor: BRAND }}>{openCount}</div>
-                        )}
-                      </div>
-
-                      {/* Mixpanel data */}
-                      <div className="rounded-lg p-3 mb-3" style={{ backgroundColor: BG2 }}>
-                        <div className="text-[10px] text-gray-500 uppercase tracking-wide mb-1.5">
-                          Last Activity{c.daysAgo !== null && c.daysAgo !== undefined ? " · " + c.daysAgo + "d ago" : ""}
+                        <div className="flex items-center gap-1.5 mt-1">
+                          <div className="w-2 h-2 rounded-full" style={{ backgroundColor: hcol }} />
+                          <span className="text-xs font-medium" style={{ color: hcol }}>{h}</span>
+                          <span className="text-[10px] text-gray-600">· {c.domain}</span>
                         </div>
-                        <div className="text-xs text-gray-200 font-medium truncate">{c.lastEvent || "—"}</div>
-                        <div className="text-[11px] text-gray-400 mt-0.5 truncate">{c.lastUser || "—"}</div>
                       </div>
-
-                      {/* Stats row */}
-                      <div className="grid grid-cols-3 gap-2 mb-3">
-                        {[
-                          ["30d Events",  c.eventCount ?? "—"],
-                          ["Top Feature", null],
-                          ["New Users",   c.newUsers ?? "—"],
-                        ].map(([l, v], i) => (
-                          <div key={l} className="rounded-lg p-2 text-center" style={{ backgroundColor: BG2 }}>
-                            {i === 1
-                              ? <div className="text-[10px] text-gray-200 font-medium leading-tight">{c.topEvent || "—"}</div>
-                              : <div className="text-sm font-bold" style={{ color: BRAND }}>{v}</div>
-                            }
-                            <div className="text-[10px] text-gray-500 mt-0.5">{l}</div>
-                          </div>
-                        ))}
-                      </div>
-
-                      {/* Next task */}
-                      {nextTodo ? (
-                        <div className="rounded-lg p-2 text-xs" style={{ backgroundColor: BG2 }}>
-                          <div className="text-gray-500 text-[10px] mb-0.5">Next task</div>
-                          <div className="flex items-center gap-1.5">
-                            <div className="w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ backgroundColor: PRIORITY[nextTodo.priority] }} />
-                            <span className="text-gray-200 truncate">{nextTodo.text}</span>
-                          </div>
-                        </div>
-                      ) : (
-                        <div className="text-[11px] text-gray-600 text-center py-1">No open tasks</div>
+                      {openCount > 0 && (
+                        <div className="text-xs font-bold rounded-full w-5 h-5 flex items-center justify-center text-black" style={{ backgroundColor: BRAND }}>{openCount}</div>
                       )}
                     </div>
+
+                    <div className="rounded-lg p-3 mb-3" style={{ backgroundColor: BG2 }}>
+                      <div className="text-[10px] text-gray-500 uppercase tracking-wide mb-1.5">
+                        Last Activity{c.daysAgo != null ? " · " + c.daysAgo + "d ago" : ""}
+                      </div>
+                      <div className="text-xs text-gray-200 font-medium truncate">{c.lastEvent || (lastSynced ? "No recent activity" : "Not yet synced")}</div>
+                      <div className="text-[11px] text-gray-400 mt-0.5 truncate">{c.lastUser || (lastSynced ? "—" : "Hit Sync to load data")}</div>
+                    </div>
+
+                    <div className="grid grid-cols-3 gap-2 mb-3">
+                      {[["30d Events", c.eventCount ?? "—"], ["Top Feature", null], ["New Users", c.newUsers ?? "—"]].map(([l, v], i) => (
+                        <div key={l} className="rounded-lg p-2 text-center" style={{ backgroundColor: BG2 }}>
+                          {i === 1
+                            ? <div className="text-[10px] text-gray-200 font-medium leading-tight min-h-[20px]">{c.topEvent || "—"}</div>
+                            : <div className="text-sm font-bold" style={{ color: BRAND }}>{v}</div>}
+                          <div className="text-[10px] text-gray-500 mt-0.5">{l}</div>
+                        </div>
+                      ))}
+                    </div>
+
+                    {nextTodo ? (
+                      <div className="rounded-lg p-2 text-xs" style={{ backgroundColor: BG2 }}>
+                        <div className="text-gray-500 text-[10px] mb-0.5">Next task</div>
+                        <div className="flex items-center gap-1.5">
+                          <div className="w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ backgroundColor: PRIORITY[nextTodo.priority] }} />
+                          <span className="text-gray-200 truncate">{nextTodo.text}</span>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="text-[11px] text-gray-600 text-center py-1">No open tasks</div>
+                    )}
                   </div>
-                );
-              })}
-            </div>
-          )}
+                </div>
+              );
+            })}
+          </div>
         </div>
       ) : (
         <div className="p-6">
@@ -384,8 +401,7 @@ export default function App() {
             <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" /></svg>
             All Clients
           </button>
-
-          <div className="flex items-center justify-between mb-5">
+          <div className="flex items-center gap-3 mb-5">
             <div>
               <div className="flex items-center gap-2">
                 <h2 className="text-2xl font-bold text-white">{client.name}</h2>
@@ -413,33 +429,30 @@ export default function App() {
 
           {activeTab === "overview" && (
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-              {/* Activity */}
               <div className="rounded-xl p-5" style={{ backgroundColor: BG1, border: "1px solid " + BRD }}>
                 <div className="text-xs text-gray-500 uppercase tracking-wide font-medium mb-4">Mixpanel Activity</div>
                 <div className="space-y-4">
                   {[
-                    ["Last Event",         mpData[client.id]?.lastEvent || "—"],
-                    ["By User",            mpData[client.id]?.lastUser  || "—"],
-                    ["Date",               fmt(mpData[client.id]?.lastDate)],
-                    ["Top Feature (30d)",  mpData[client.id]?.topEvent  || "—"],
+                    ["Last Event",        mpData[client.id]?.lastEvent || "—"],
+                    ["By User",           mpData[client.id]?.lastUser  || "—"],
+                    ["Date",              fmt(mpData[client.id]?.lastDate)],
+                    ["Top Feature (90d)", mpData[client.id]?.topEvent  || "—"],
                   ].map(([l, v]) => (
                     <div key={l}>
                       <div className="text-gray-500 text-xs mb-0.5">{l}</div>
-                      <div className="text-white font-medium text-sm">{v}</div>
+                      <div className="text-white font-medium text-sm break-all">{v}</div>
                     </div>
                   ))}
                 </div>
               </div>
-
-              {/* Metrics */}
               <div className="rounded-xl p-5" style={{ backgroundColor: BG1, border: "1px solid " + BRD }}>
                 <div className="text-xs text-gray-500 uppercase tracking-wide font-medium mb-4">Account Metrics</div>
                 <div className="grid grid-cols-2 gap-3">
                   {[
-                    ["Events (30d)",    mpData[client.id]?.eventCount ?? "—"],
-                    ["New Users (MTD)", mpData[client.id]?.newUsers   ?? "—"],
-                    ["Days Since Active", mpData[client.id]?.daysAgo  ?? "—"],
-                    ["Health Status",  getHealth(mpData[client.id]?.daysAgo)],
+                    ["Events (30d)",       mpData[client.id]?.eventCount ?? "—"],
+                    ["New Users (MTD)",    mpData[client.id]?.newUsers   ?? "—"],
+                    ["Days Since Active",  mpData[client.id]?.daysAgo    ?? "—"],
+                    ["Health",             getHealth(mpData[client.id]?.daysAgo)],
                   ].map(([l, v]) => (
                     <div key={l} className="rounded-lg p-3" style={{ backgroundColor: BG2 }}>
                       <div className="text-2xl font-bold" style={{ color: BRAND }}>{v}</div>
@@ -585,7 +598,7 @@ export default function App() {
                 className="flex-1 py-2 rounded-lg text-gray-300 text-sm" style={{ backgroundColor: BG2, border: "1px solid " + BG3 }}>
                 Cancel
               </button>
-              <button onClick={() => { setClients(editingClients); setSettingsOpen(false); setMpData({}); }}
+              <button onClick={() => { setClients(editingClients); setSettingsOpen(false); setMpData({}); saveCache(null); }}
                 className="flex-1 py-2 rounded-lg text-black text-sm font-medium hover:opacity-90"
                 style={{ backgroundColor: BRAND }}>
                 Save & Sync
