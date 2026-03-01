@@ -17,12 +17,8 @@ const KEY_EVENTS = [
 ];
 
 const DEFAULT_CLIENTS = [
-  { id: 1, name: "Acme Corp",          domain: "acme.com",      tier: "Enterprise", todos: [] },
-  { id: 2, name: "Globex Inc",         domain: "globex.io",     tier: "Growth",     todos: [] },
-  { id: 3, name: "Initech LLC",        domain: "initech.com",   tier: "Starter",    todos: [] },
-  { id: 4, name: "Umbrella Co",        domain: "umbrella.com",  tier: "Enterprise", todos: [] },
-  { id: 5, name: "Vandelay Industries",domain: "vandelay.com",  tier: "Growth",     todos: [] },
-  { id: 6, name: "Bluth Company",      domain: "bluth.co",      tier: "Starter",    todos: [] },
+  { id: 1, name: "Kimley Horn", domain: "kimley-horn.com", tier: "Enterprise", todos: [] },
+  { id: 2, name: "SiteMarker",  domain: "sitemarker.com",  tier: "Enterprise", todos: [] },
 ];
 
 const TIER_BADGE = {
@@ -53,102 +49,111 @@ function fmt(dateStr) {
 }
 
 // ── Mixpanel API helper ──────────────────────────────────────────────────────
-async function mpCall(endpoint, params) {
-  const res = await fetch("/api/mixpanel", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ endpoint, params }),
-  });
-  if (!res.ok) throw new Error("Proxy error " + res.status);
-  return res.json();
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function mpCall(endpoint, params, retries = 3) {
+  for (let i = 0; i < retries; i++) {
+    const res = await fetch("/api/mixpanel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ endpoint, params }),
+    });
+    const data = await res.json();
+    if (res.status === 429) {
+      console.log("Rate limited, waiting 2s before retry", i + 1);
+      await sleep(2000 * (i + 1));
+      continue;
+    }
+    if (!res.ok) throw new Error(data.error || "Proxy error " + res.status);
+    return data;
+  }
+  throw new Error("Rate limit exceeded after retries");
 }
 
-// Fetch all user profiles matching a domain
-async function fetchProfilesByDomain(domain) {
-  const selector = `properties["$email"] =~ "(?i)@${domain.replace(".", "\\.")}$"`;
-  const data = await mpCall("engage", { where: selector, include_all_users: true });
-  return data.results || [];
+function domainRegex(domain) {
+  return `properties["$email"] =~ "(?i)@${domain.replace(/\./g, "\\\\.")}$"`;
 }
 
-// Fetch total events in last 30 days for a set of distinct_ids
-async function fetchEventCount(domain) {
-  const to   = new Date().toISOString().slice(0, 10);
-  const from = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
-  const data = await mpCall("segmentation", {
-    event:     KEY_EVENTS[0],
-    from_date: from,
-    to_date:   to,
-    where:     `properties["$email"] =~ "(?i)@${domain.replace(".", "\\.")}$"`,
-    type:      "general",
-    unit:      "month",
-  });
-  const values = data?.data?.values?.[KEY_EVENTS[0]];
-  if (!values) return 0;
-  return Object.values(values).reduce((s, v) => s + v, 0);
-}
+// Fetch all data for a single domain sequentially to avoid rate limits
+async function fetchAllForDomain(domain) {
+  const to30   = new Date().toISOString().slice(0, 10);
+  const from30 = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
+  const from90 = new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10);
+  const fromMTD = new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString().slice(0, 10);
+  const where = domainRegex(domain);
 
-// Fetch last event for a domain
-async function fetchLastEvent(domain) {
-  const to   = new Date().toISOString().slice(0, 10);
-  const from = new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10);
-  const data = await mpCall("export", {
-    from_date:   from,
-    to_date:     to,
-    event:       JSON.stringify(KEY_EVENTS),
-    where:       `properties["$email"] =~ "(?i)@${domain.replace(".", "\\.")}$"`,
-    limit:       500,
-  });
-  const events = (data.results || []).sort((a, b) =>
-    new Date(b.properties.time * 1000) - new Date(a.properties.time * 1000)
-  );
-  if (!events.length) return null;
-  const e = events[0];
-  return {
-    lastEvent: e.event,
-    lastUser:  e.properties["$email"] || e.properties.distinct_id,
-    lastDate:  new Date(e.properties.time * 1000).toISOString().slice(0, 10),
-    daysAgo:   daysSince(new Date(e.properties.time * 1000).toISOString().slice(0, 10)),
-  };
-}
+  // 1. Last event via export
+  let lastEvent = null;
+  try {
+    await sleep(300);
+    const exportData = await mpCall("export", {
+      from_date: from90,
+      to_date:   to30,
+      event:     JSON.stringify(KEY_EVENTS),
+      where,
+    });
+    const events = (exportData.results || []).sort((a, b) => b.properties.time - a.properties.time);
+    if (events.length) {
+      const e = events[0];
+      const d = new Date(e.properties.time * 1000).toISOString().slice(0, 10);
+      lastEvent = {
+        lastEvent: e.event,
+        lastUser:  e.properties["$email"] || e.properties.distinct_id || "—",
+        lastDate:  d,
+        daysAgo:   daysSince(d),
+      };
+    }
+  } catch (e) { console.warn("export failed:", e.message); }
 
-// Fetch top event for a domain
-async function fetchTopEvent(domain) {
-  const to   = new Date().toISOString().slice(0, 10);
-  const from = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
-  const counts = await Promise.all(KEY_EVENTS.map(async ev => {
+  // 2. Total event count (use User Signed In as proxy for total activity)
+  let eventCount = 0;
+  try {
+    await sleep(500);
+    const seg = await mpCall("segmentation", {
+      event: "User Signed In", from_date: from30, to_date: to30,
+      where, type: "general", unit: "month",
+    });
+    const vals = seg?.data?.values?.["User Signed In"];
+    eventCount = vals ? Object.values(vals).reduce((s, v) => s + v, 0) : 0;
+  } catch (e) { console.warn("eventCount failed:", e.message); }
+
+  // 3. Top event — run sequentially through key events
+  let topEvent = null;
+  let topCount = 0;
+  for (const ev of KEY_EVENTS.slice(0, 5)) { // limit to 5 to reduce calls
     try {
-      const data = await mpCall("segmentation", {
-        event:     ev,
-        from_date: from,
-        to_date:   to,
-        where:     `properties["$email"] =~ "(?i)@${domain.replace(".", "\\.")}$"`,
-        type:      "general",
-        unit:      "month",
+      await sleep(600);
+      const seg = await mpCall("segmentation", {
+        event: ev, from_date: from30, to_date: to30,
+        where, type: "general", unit: "month",
       });
-      const vals = data?.data?.values?.[ev];
-      const total = vals ? Object.values(vals).reduce((s, v) => s + v, 0) : 0;
-      return { event: ev, count: total };
-    } catch { return { event: ev, count: 0 }; }
-  }));
-  const top = counts.sort((a, b) => b.count - a.count)[0];
-  return top?.count > 0 ? top.event : null;
-}
+      const vals = seg?.data?.values?.[ev];
+      const count = vals ? Object.values(vals).reduce((s, v) => s + v, 0) : 0;
+      if (count > topCount) { topCount = count; topEvent = ev; }
+    } catch (e) { console.warn("topEvent failed for", ev, e.message); }
+  }
 
-// Fetch new signups this month for a domain
-async function fetchNewUsers(domain) {
-  const now  = new Date();
-  const from = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().slice(0, 10);
-  const to   = now.toISOString().slice(0, 10);
-  const data = await mpCall("segmentation", {
-    event:     "User Signed Up",
-    from_date: from,
-    to_date:   to,
-    where:     `properties["$email"] =~ "(?i)@${domain.replace(".", "\\.")}$"`,
-    type:      "general",
-    unit:      "month",
-  });
-  const vals = data?.data?.values?.["User Signed Up"];
-  return vals ? Object.values(vals).reduce((s, v) => s + v, 0) : 0;
+  // 4. New users this month
+  let newUsers = 0;
+  try {
+    await sleep(500);
+    const seg = await mpCall("segmentation", {
+      event: "User Signed Up", from_date: fromMTD, to_date: to30,
+      where, type: "general", unit: "month",
+    });
+    const vals = seg?.data?.values?.["User Signed Up"];
+    newUsers = vals ? Object.values(vals).reduce((s, v) => s + v, 0) : 0;
+  } catch (e) { console.warn("newUsers failed:", e.message); }
+
+  return {
+    lastEvent:  lastEvent?.lastEvent || "No recent activity",
+    lastUser:   lastEvent?.lastUser  || "—",
+    lastDate:   lastEvent?.lastDate  || null,
+    daysAgo:    lastEvent?.daysAgo   ?? null,
+    eventCount,
+    topEvent:   topEvent || "—",
+    newUsers,
+  };
 }
 
 // ── Sub-components ───────────────────────────────────────────────────────────
@@ -206,24 +211,13 @@ export default function App() {
     for (const c of clients) {
       setLoadingMsg("Loading " + c.name + "...");
       try {
-        const [lastEvt, count, topEvt, newUsers] = await Promise.all([
-          fetchLastEvent(c.domain),
-          fetchEventCount(c.domain),
-          fetchTopEvent(c.domain),
-          fetchNewUsers(c.domain),
-        ]);
-        result[c.id] = {
-          lastEvent:  lastEvt?.lastEvent  || "No recent activity",
-          lastUser:   lastEvt?.lastUser   || "—",
-          lastDate:   lastEvt?.lastDate   || null,
-          daysAgo:    lastEvt?.daysAgo    ?? null,
-          eventCount: count,
-          topEvent:   topEvt || "—",
-          newUsers:   newUsers,
-        };
+        result[c.id] = await fetchAllForDomain(c.domain);
       } catch (e) {
-        result[c.id] = { lastEvent: "Error", lastUser: "—", lastDate: null, daysAgo: null, eventCount: 0, topEvent: "—", newUsers: 0 };
+        console.error("Failed for", c.name, e.message);
+        result[c.id] = { lastEvent: "Error loading", lastUser: "—", lastDate: null, daysAgo: null, eventCount: 0, topEvent: "—", newUsers: 0 };
       }
+      // Update UI after each client so results appear progressively
+      setMpData({ ...result });
     }
     setMpData(result);
     setLoading(false);
