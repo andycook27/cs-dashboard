@@ -3,7 +3,7 @@ import { useState } from "react";
 const BRAND = "#B5DF07";
 
 const PRIORITY = { High: "#ef4444", Medium: BRAND, Low: "#6b7280" };
-const PRIORITY_BG = { High: "bg-red-500", Medium: "", Low: "bg-gray-500" };
+
 
 const STATUS_COLORS = {
   "To Do": "bg-gray-700 text-gray-200",
@@ -170,8 +170,7 @@ export default function App() {
             ["Open Tasks", stats.openTodos, "text-gray-300"],
           ].map(([l, v, cls]) => (
             <div key={l} className="rounded-lg px-3 py-2 min-w-[64px]" style={{ backgroundColor: "#1a1a1a", border: "1px solid #2a2a2a" }}>
-              <div className={`text-xl font-bold ${cls}`} style={l === "Healthy" || l === "Open Tasks" && !cls ? { color: BRAND } : l === "Open Tasks" ? {} : {}}
-                   {...(l === "Healthy" ? { style: { color: BRAND } } : {})}>
+              <div className={`text-xl font-bold ${cls}`} style={l === "Healthy" ? { color: BRAND } : {}}>
                 {v}
               </div>
               <div className="text-[10px] text-gray-500 uppercase tracking-wide">{l}</div>
@@ -405,7 +404,7 @@ export default function App() {
                   <select value={form.priority} onChange={e => setForm(f => ({ ...f, priority: e.target.value }))}
                     className="w-full rounded-lg px-3 py-2 text-white text-sm focus:outline-none"
                     style={{ backgroundColor: "#1a1a1a", border: "1px solid #2a2a2a" }}>
-                    {Object.keys(PRIORITY).map(p => <option key={p}>{p}</option>)}
+                    {Object.keys(PRIORITY).map(p => <option key={p} value={p}>{p}</option>)}
                   </select>
                 </div>
                 <div>
