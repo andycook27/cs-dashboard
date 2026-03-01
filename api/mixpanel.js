@@ -1,68 +1,132 @@
 // api/mixpanel.js
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   if (req.method === "OPTIONS") return res.status(200).end();
-  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
-  const { endpoint, params } = req.body;
   const username  = process.env.MIXPANEL_SERVICE_ACCOUNT_USER;
   const password  = process.env.MIXPANEL_SERVICE_ACCOUNT_SECRET;
   const projectId = process.env.MIXPANEL_PROJECT_ID;
+  const auth      = Buffer.from(username + ":" + password).toString("base64");
+  const headers   = { Authorization: "Basic " + auth, Accept: "application/json" };
+
+  // ── GET: debug endpoint ───────────────────────────────────────────────────
+  if (req.method === "GET") {
+    const { debug, domain } = req.query;
+
+    // Just check env vars
+    if (!debug) {
+      return res.status(200).json({
+        status: "ok",
+        hasUser: !!username,
+        hasSecret: !!password,
+        hasProjectId: !!projectId,
+      });
+    }
+
+    // Test Engage API
+    if (debug === "engage") {
+      try {
+        const where = `properties["$email"] =~ "(?i)@${domain || "sitemarker.com"}$"`;
+        const body  = new URLSearchParams({ where, project_id: projectId });
+        const r     = await fetch("https://mixpanel.com/api/2.0/engage", {
+          method:  "POST",
+          headers: { ...headers, "Content-Type": "application/x-www-form-urlencoded" },
+          body:    body.toString(),
+        });
+        const text = await r.text();
+        console.log("Debug engage status:", r.status, text.slice(0, 500));
+        return res.status(r.status).send(text);
+      } catch (e) {
+        return res.status(500).json({ error: e.message });
+      }
+    }
+
+    // Test Export API
+    if (debug === "export") {
+      try {
+        const to   = new Date().toISOString().slice(0, 10);
+        const from = new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10);
+        const qs   = new URLSearchParams({
+          from_date:  from,
+          to_date:    to,
+          project_id: projectId,
+          event:      JSON.stringify(["User Signed In"]),
+        }).toString();
+        const r    = await fetch("https://data.mixpanel.com/api/2.0/export?" + qs, {
+          headers: { ...headers, Accept: "text/plain" },
+        });
+        const text = await r.text();
+        console.log("Debug export status:", r.status, text.slice(0, 500));
+        return res.status(r.status).send(text.slice(0, 3000));
+      } catch (e) {
+        return res.status(500).json({ error: e.message });
+      }
+    }
+
+    return res.status(400).json({ error: "Unknown debug type. Use ?debug=engage or ?debug=export" });
+  }
+
+  // ── POST: normal proxy ────────────────────────────────────────────────────
+  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+
+  const { endpoint, params } = req.body;
 
   if (!username || !password || !projectId) {
     return res.status(500).json({ error: "Missing env vars" });
   }
 
-  const auth = Buffer.from(username + ":" + password).toString("base64");
-  const headers = { Authorization: "Basic " + auth, Accept: "application/json" };
-
   try {
-    // ── ENGAGE: fetch user profiles by email domain ──────────────────────────
+    // ENGAGE
     if (endpoint === "engage") {
-      const domain = params.domain;
-      const selector = `properties["$email"] =~ "(?i)@${domain}$"`;
-      let allProfiles = [];
-      let sessionId = null;
-      let page = 0;
+      const domain   = params.domain;
+      const where    = `properties["$email"] =~ "(?i)@${domain}$"`;
+      let allResults = [];
+      let sessionId  = null;
+      let page       = 0;
 
-      // Engage API paginates — loop until all pages fetched
       while (true) {
-        const body = { where: selector, project_id: projectId };
-        if (sessionId) { body.session_id = sessionId; body.page = page; }
+        const bodyObj = { where, project_id: projectId };
+        if (sessionId) { bodyObj.session_id = sessionId; bodyObj.page = String(page); }
 
-        const qRes = await fetch("https://mixpanel.com/api/2.0/engage", {
-          method: "POST",
+        const r    = await fetch("https://mixpanel.com/api/2.0/engage", {
+          method:  "POST",
           headers: { ...headers, "Content-Type": "application/x-www-form-urlencoded" },
-          body: new URLSearchParams(body).toString(),
+          body:    new URLSearchParams(bodyObj).toString(),
         });
+        const text = await r.text();
+        console.log("Engage page", page, "status:", r.status, "body:", text.slice(0, 400));
 
-        const data = await qRes.json();
-        console.log("Engage page", page, "status:", qRes.status, "results:", data.results?.length, "total:", data.total);
+        if (!r.ok) {
+          return res.status(r.status).json({ error: "Engage failed", status: r.status, body: text.slice(0, 500) });
+        }
 
-        if (!qRes.ok || !data.results) break;
-        allProfiles = allProfiles.concat(data.results);
+        let data;
+        try { data = JSON.parse(text); } catch { break; }
+        if (!data.results?.length) break;
+
+        allResults = allResults.concat(data.results);
+        console.log("Engage accumulated:", allResults.length, "of", data.total);
 
         if (!sessionId) sessionId = data.session_id;
-        if (allProfiles.length >= data.total || !data.results.length) break;
+        if (allResults.length >= data.total) break;
         page++;
-        if (page > 10) break; // safety cap
+        if (page > 20) break;
       }
 
-      return res.status(200).json({ results: allProfiles });
+      return res.status(200).json({ results: allResults, total: allResults.length });
     }
 
-    // ── EXPORT: fetch raw events by distinct_ids ─────────────────────────────
+    // EXPORT
     if (endpoint === "export") {
       const { from_date, to_date, event, distinct_ids } = params;
 
-      // Build where clause filtering by distinct_id list
       let where = "";
-      if (distinct_ids && distinct_ids.length) {
-        const ids = distinct_ids.slice(0, 50); // Mixpanel selector has limits
-        const idClauses = ids.map(id => `distinct_id == "${id}"`).join(" or ");
-        where = `(${idClauses})`;
+      if (distinct_ids?.length) {
+        const ids     = distinct_ids.slice(0, 50);
+        const clauses = ids.map(id => `distinct_id == "${id}"`).join(" or ");
+        where         = `(${clauses})`;
       }
 
       const exportParams = { from_date, to_date, project_id: projectId };
@@ -71,39 +135,18 @@ export default async function handler(req, res) {
 
       const qs  = new URLSearchParams(exportParams).toString();
       const url = "https://data.mixpanel.com/api/2.0/export?" + qs;
+      console.log("Export URL:", url.slice(0, 250));
 
-      console.log("Export URL:", url.slice(0, 200));
+      const r    = await fetch(url, { headers: { ...headers, Accept: "text/plain" } });
+      const text = await r.text();
+      console.log("Export status:", r.status, "| preview:", text.slice(0, 400));
 
-      const mpRes = await fetch(url, { headers: { ...headers, Accept: "text/plain" } });
-      const text  = await mpRes.text();
-
-      console.log("Export status:", mpRes.status, "| preview:", text.slice(0, 300));
-
-      if (!mpRes.ok) {
-        return res.status(mpRes.status).json({ error: "Export failed", body: text.slice(0, 500) });
-      }
+      if (!r.ok) return res.status(r.status).json({ error: "Export failed", status: r.status, body: text.slice(0, 500) });
 
       const lines  = text.trim().split("\n").filter(Boolean);
       const parsed = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
-      console.log("Export parsed:", parsed.length, "events");
+      console.log("Export events parsed:", parsed.length);
       return res.status(200).json({ results: parsed });
-    }
-
-    // ── SEGMENTATION: count events ───────────────────────────────────────────
-    if (endpoint === "segmentation") {
-      const segParams = { ...params, project_id: projectId };
-      const qs  = new URLSearchParams(segParams).toString();
-      const url = "https://mixpanel.com/api/2.0/segmentation?" + qs;
-
-      const mpRes = await fetch(url, { headers });
-      const text  = await mpRes.text();
-
-      console.log("Segmentation status:", mpRes.status, "| preview:", text.slice(0, 200));
-
-      if (!mpRes.ok) {
-        return res.status(mpRes.status).json({ error: "Segmentation failed", body: text.slice(0, 500) });
-      }
-      return res.status(200).json(JSON.parse(text));
     }
 
     return res.status(400).json({ error: "Unknown endpoint: " + endpoint });
