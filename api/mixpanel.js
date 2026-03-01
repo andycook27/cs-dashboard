@@ -28,7 +28,7 @@ export default async function handler(req, res) {
     // Test Engage API
     if (debug === "engage") {
       try {
-        const where = `properties["$email"] =~ "(?i)@${domain || "sitemarker.com"}$"`;
+        const where = `properties["$email"] like "%@${domain || "sitemarker.com"}"`;
         const body  = new URLSearchParams({ where, project_id: projectId });
         const r     = await fetch("https://mixpanel.com/api/2.0/engage", {
           method:  "POST",
@@ -81,7 +81,7 @@ export default async function handler(req, res) {
     // ENGAGE
     if (endpoint === "engage") {
       const domain   = params.domain;
-      const where    = `properties["$email"] =~ "(?i)@${domain}$"`;
+      const where    = `properties["$email"] like "%@${domain}"`;
       let allResults = [];
       let sessionId  = null;
       let page       = 0;
