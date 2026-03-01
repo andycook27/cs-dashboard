@@ -220,9 +220,27 @@ export default async function handler(req, res) {
 
       console.log("Export: running", chunks.length, "batch(es) of up to", BATCH, "IDs");
 
+      // First: try a no-where probe request to confirm base Export works at all
+      // This eliminates auth/date/event issues from where-clause issues
+      try {
+        const probeParams = { from_date, to_date, project_id: projectId };
+        if (eventStr) probeParams.event = eventStr;
+        const probeR = await mpFetch("https://data.mixpanel.com/api/2.0/export", {
+          method:  "POST",
+          headers: { ...headers, "Content-Type": "application/x-www-form-urlencoded", Accept: "text/plain" },
+          body:    new URLSearchParams(probeParams).toString(),
+        });
+        const probeText = await probeR.text();
+        console.log("Export probe (no where) status:", probeR.status, "| preview:", probeText.slice(0, 200));
+        if (!probeR.ok) {
+          return res.status(probeR.status).json({ error: "Export failed even without where clause", body: probeText.slice(0, 500) });
+        }
+      } catch (e) {
+        return res.status(500).json({ error: "Export probe failed: " + e.message });
+      }
+
       let allLines = [];
       if (chunks.length === 0) {
-        // No ID filter — fetch without where clause
         try {
           const text = await runExport("");
           if (text?.trim()) allLines = text.trim().split("\n").filter(Boolean);
@@ -231,14 +249,22 @@ export default async function handler(req, res) {
         }
       } else {
         for (const chunk of chunks) {
-          const where = "(" + chunk.map(id => `distinct_id == "${id}"`).join(" or ") + ")";
-          try {
-            const text = await runExport(where);
-            if (text?.trim()) allLines.push(...text.trim().split("\n").filter(Boolean));
-          } catch (e) {
-            console.error("Export chunk failed:", e.message);
-            // Continue with remaining chunks rather than failing entirely
+          // Try both syntaxes — some Mixpanel projects use different JQL dialects
+          const whereV1 = "(" + chunk.map(id => `distinct_id == "${id}"`).join(" or ") + ")";
+          const whereV2 = "(" + chunk.map(id => `properties["distinct_id"] == "${id}"`).join(" or ") + ")";
+          let chunkDone = false;
+          for (const where of [whereV1, whereV2]) {
+            try {
+              const text = await runExport(where);
+              if (text?.trim()) allLines.push(...text.trim().split("\n").filter(Boolean));
+              console.log("Export chunk succeeded with where syntax:", where.slice(0, 60));
+              chunkDone = true;
+              break;
+            } catch (e) {
+              console.warn("Export chunk syntax failed:", where.slice(0, 60), "—", e.message);
+            }
           }
+          if (!chunkDone) console.error("Export chunk failed with all syntaxes for", chunk.length, "IDs");
         }
       }
 
