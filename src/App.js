@@ -51,109 +51,106 @@ function fmt(dateStr) {
 // ── Mixpanel API helper ──────────────────────────────────────────────────────
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-async function mpCall(endpoint, params, retries = 3) {
-  for (let i = 0; i < retries; i++) {
-    const res = await fetch("/api/mixpanel", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ endpoint, params }),
-    });
-    const data = await res.json();
-    if (res.status === 429) {
-      console.log("Rate limited, waiting 2s before retry", i + 1);
-      await sleep(2000 * (i + 1));
-      continue;
-    }
-    if (!res.ok) throw new Error(data.error || "Proxy error " + res.status);
-    return data;
+async function mpCall(endpoint, params) {
+  const res = await fetch("/api/mixpanel", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ endpoint, params }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || "Proxy error " + res.status);
+  return data;
+}
+
+// Step 1: get all distinct_ids for a domain via Engage (user profiles)
+async function fetchDistinctIds(domain) {
+  try {
+    const data = await mpCall("engage", { domain });
+    const profiles = data.results || [];
+    console.log("Profiles found for", domain, ":", profiles.length);
+    return profiles.map(p => p.$distinct_id).filter(Boolean);
+  } catch (e) {
+    console.warn("engage failed:", e.message);
+    return [];
   }
-  throw new Error("Rate limit exceeded after retries");
 }
 
-function domainRegex(domain) {
-  // Single escape the dot — Mixpanel regex needs \. not \\.
-  const escaped = domain.replace(/\./g, "\\.");
-  return `properties["$email"] =~ "(?i)@${escaped}$"`;
-}
-
-// Fetch all data for a single domain sequentially to avoid rate limits
+// Step 2: fetch all data using distinct_ids
 async function fetchAllForDomain(domain) {
-  const to30   = new Date().toISOString().slice(0, 10);
-  const from30 = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
+  const to90   = new Date().toISOString().slice(0, 10);
   const from90 = new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10);
+  const from30 = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
   const fromMTD = new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString().slice(0, 10);
-  const where = domainRegex(domain);
 
-  // 1. Last event via export
-  let lastEvent = null;
+  // Get distinct_ids for this domain
+  const distinctIds = await fetchDistinctIds(domain);
+  if (!distinctIds.length) {
+    console.warn("No users found for domain:", domain);
+    return { lastEvent: "No users found", lastUser: "—", lastDate: null, daysAgo: null, eventCount: 0, topEvent: "—", newUsers: 0 };
+  }
+  console.log("Found", distinctIds.length, "users for", domain);
+
+  // 1. Last event via export filtered by distinct_ids
+  let lastEventData = null;
   try {
     await sleep(300);
     const exportData = await mpCall("export", {
-      from_date: from90,
-      to_date:   to30,
-      event:     JSON.stringify(KEY_EVENTS),
-      where,
+      from_date:    from90,
+      to_date:      to90,
+      event:        JSON.stringify(KEY_EVENTS),
+      distinct_ids: distinctIds,
     });
     const events = (exportData.results || []).sort((a, b) => b.properties.time - a.properties.time);
     if (events.length) {
       const e = events[0];
       const d = new Date(e.properties.time * 1000).toISOString().slice(0, 10);
-      lastEvent = {
+      // Look up the user's email from profiles
+      lastEventData = {
         lastEvent: e.event,
-        lastUser:  e.properties["$email"] || e.properties.distinct_id || "—",
+        lastUser:  e.properties["$email"] || e.properties.email || e.distinct_id || "—",
         lastDate:  d,
         daysAgo:   daysSince(d),
       };
     }
   } catch (e) { console.warn("export failed:", e.message); }
 
-  // 2. Total event count (use User Signed In as proxy for total activity)
+  // 2. Event count — count all key events in export results
   let eventCount = 0;
+  let topEventMap = {};
   try {
-    await sleep(500);
-    const seg = await mpCall("segmentation", {
-      event: "User Signed In", from_date: from30, to_date: to30,
-      where, type: "general", unit: "month",
+    await sleep(300);
+    const exportData = await mpCall("export", {
+      from_date:    from30,
+      to_date:      to90,
+      event:        JSON.stringify(KEY_EVENTS),
+      distinct_ids: distinctIds,
     });
-    const vals = seg?.data?.values?.["User Signed In"];
-    eventCount = vals ? Object.values(vals).reduce((s, v) => s + v, 0) : 0;
+    const events = exportData.results || [];
+    eventCount = events.length;
+    events.forEach(e => { topEventMap[e.event] = (topEventMap[e.event] || 0) + 1; });
   } catch (e) { console.warn("eventCount failed:", e.message); }
 
-  // 3. Top event — run sequentially through key events
-  let topEvent = null;
-  let topCount = 0;
-  for (const ev of KEY_EVENTS.slice(0, 5)) { // limit to 5 to reduce calls
-    try {
-      await sleep(600);
-      const seg = await mpCall("segmentation", {
-        event: ev, from_date: from30, to_date: to30,
-        where, type: "general", unit: "month",
-      });
-      const vals = seg?.data?.values?.[ev];
-      const count = vals ? Object.values(vals).reduce((s, v) => s + v, 0) : 0;
-      if (count > topCount) { topCount = count; topEvent = ev; }
-    } catch (e) { console.warn("topEvent failed for", ev, e.message); }
-  }
+  // 3. Top event from the count above
+  const topEvent = Object.entries(topEventMap).sort((a, b) => b[1] - a[1])[0]?.[0] || "—";
 
-  // 4. New users this month
+  // 4. New users — count profiles created this month
   let newUsers = 0;
   try {
-    await sleep(500);
-    const seg = await mpCall("segmentation", {
-      event: "User Signed Up", from_date: fromMTD, to_date: to30,
-      where, type: "general", unit: "month",
-    });
-    const vals = seg?.data?.values?.["User Signed Up"];
-    newUsers = vals ? Object.values(vals).reduce((s, v) => s + v, 0) : 0;
+    const mtdProfiles = await mpCall("engage", { domain });
+    const mtdStart = new Date(fromMTD).getTime();
+    newUsers = (mtdProfiles.results || []).filter(p => {
+      const created = p.$properties?.$created;
+      return created && new Date(created).getTime() >= mtdStart;
+    }).length;
   } catch (e) { console.warn("newUsers failed:", e.message); }
 
   return {
-    lastEvent:  lastEvent?.lastEvent || "No recent activity",
-    lastUser:   lastEvent?.lastUser  || "—",
-    lastDate:   lastEvent?.lastDate  || null,
-    daysAgo:    lastEvent?.daysAgo   ?? null,
+    lastEvent:  lastEventData?.lastEvent || "No recent activity",
+    lastUser:   lastEventData?.lastUser  || "—",
+    lastDate:   lastEventData?.lastDate  || null,
+    daysAgo:    lastEventData?.daysAgo   ?? null,
     eventCount,
-    topEvent:   topEvent || "—",
+    topEvent,
     newUsers,
   };
 }
