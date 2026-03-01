@@ -13,7 +13,7 @@ const BG0 = "#0a0a0a", BG1 = "#111111", BG2 = "#1a1a1a", BG3 = "#2a2a2a", BRD = 
 const COOLDOWN_MS = 30 * 60 * 1000;
 const CACHE_KEY   = "mp_cache_v1";
 
-// These must exactly match event names in Mixpanel Lexicon (case-sensitive)
+// Must exactly match Mixpanel Lexicon event names (case-sensitive, whitespace-sensitive)
 const KEY_EVENTS = [
   "User Signed In",
   "Project Created",
@@ -70,7 +70,10 @@ function timeAgo(ts) {
 let memCache = null;
 function loadCache() {
   if (memCache) return memCache;
-  try { const r = sessionStorage.getItem(CACHE_KEY); if (r) { memCache = JSON.parse(r); return memCache; } } catch {}
+  try {
+    const r = sessionStorage.getItem(CACHE_KEY);
+    if (r) { memCache = JSON.parse(r); return memCache; }
+  } catch {}
   return null;
 }
 function saveCache(data) {
@@ -78,88 +81,139 @@ function saveCache(data) {
   try { sessionStorage.setItem(CACHE_KEY, JSON.stringify(data)); } catch {}
 }
 
-// ── API proxy ─────────────────────────────────────────────────────────────────
+// ── API proxy call ────────────────────────────────────────────────────────────
 async function mpCall(endpoint, params) {
   console.log("mpCall →", endpoint, JSON.stringify(params).slice(0, 200));
-  const res  = await fetch("/api/mixpanel", {
-    method:  "POST",
-    headers: { "Content-Type": "application/json" },
-    body:    JSON.stringify({ endpoint, params }),
-  });
-  const data = await res.json();
+
+  let res;
+  try {
+    res = await fetch("/api/mixpanel", {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({ endpoint, params }),
+    });
+  } catch (e) {
+    // RISK: network failure (offline, Vercel cold start timeout, DNS failure)
+    throw new Error("Network error calling /api/mixpanel: " + e.message);
+  }
+
+  let data;
+  try {
+    data = await res.json();
+  } catch (e) {
+    // RISK: proxy returned non-JSON (e.g. Vercel 504 HTML page)
+    throw new Error("Non-JSON response from proxy (status " + res.status + ") — check Vercel logs");
+  }
+
   console.log("mpCall ←", endpoint, "status:", res.status, "keys:", Object.keys(data));
+
   if (!res.ok) throw new Error(data.error || data.body || "API error " + res.status);
   return data;
 }
 
-// ── Core fetch logic ──────────────────────────────────────────────────────────
+// ── Core data fetch ───────────────────────────────────────────────────────────
 async function fetchDomainData(domains) {
 
-  // Step 1: Engage → get all profiles for these domains
-  console.log("[fetchDomainData] Starting Engage for domains:", domains);
-  const engageData = await mpCall("engage", { domain: domains });
-  const profiles   = engageData.results || [];
-  console.log("[fetchDomainData] Engage returned", profiles.length, "profiles");
+  // RISK: domains array empty or undefined — would send bad Engage request
+  if (!domains || domains.length === 0) {
+    throw new Error("No domains configured for this client");
+  }
+  const cleanDomains = domains.map(d => String(d).trim().toLowerCase()).filter(Boolean);
+  if (!cleanDomains.length) throw new Error("All domains were empty after cleaning");
+
+  // ── Step 1: Engage → profiles ─────────────────────────────────────────────
+  console.log("[fetchDomainData] Engage for domains:", cleanDomains);
+  const engageData = await mpCall("engage", { domain: cleanDomains });
+
+  // RISK: results key missing or not an array
+  const profiles = Array.isArray(engageData.results) ? engageData.results : [];
+  console.log("[fetchDomainData] Engage profiles:", profiles.length);
 
   if (!profiles.length) {
-    return { lastEvent: "No users found", lastUser: "—", lastDate: null, daysAgo: null, eventCount: 0, topEvent: "—", newUsers: 0 };
+    return {
+      lastEvent: "No users found", lastUser: "—", lastDate: null,
+      daysAgo: null, eventCount: 0, topEvent: "—", newUsers: 0,
+    };
   }
 
-  // Extract distinct_ids for Export filter
-  const distinctIds = profiles.map(p => p.$distinct_id).filter(Boolean);
-  console.log("[fetchDomainData] distinct_ids count:", distinctIds.length);
+  // RISK: $distinct_id missing on some profiles — filter defensively
+  const distinctIds = profiles.map(p => p?.$distinct_id).filter(id => id && typeof id === "string");
+  console.log("[fetchDomainData] valid distinct_ids:", distinctIds.length, "of", profiles.length);
 
-  // Count new users this month
+  if (!distinctIds.length) {
+    throw new Error("Engage returned profiles but none had valid $distinct_id");
+  }
+
+  // New users this month — check all known created-date property names
   const mtdStart = new Date(new Date().getFullYear(), new Date().getMonth(), 1).getTime();
   const newUsers  = profiles.filter(p => {
-    const created = p.$properties?.$created || p.$properties?.created || p.$properties?.created_at;
-    return created && new Date(created).getTime() >= mtdStart;
+    const props   = p?.$properties || {};
+    const created = props.$created || props.created || props.created_at;
+    if (!created) return false;
+    const t = new Date(created).getTime();
+    // RISK: invalid date strings would return NaN — guard with isNaN
+    return !isNaN(t) && t >= mtdStart;
   }).length;
 
-  // Step 2: Export → get events for those users
+  // ── Step 2: Export → events ───────────────────────────────────────────────
+  // Date range: 90 days back. Max allowed by Mixpanel Export is 365 days.
   const to90   = new Date().toISOString().slice(0, 10);
   const from90 = new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10);
 
-  console.log("[fetchDomainData] Starting Export, date range:", from90, "→", to90, "ids:", distinctIds.length);
+  console.log("[fetchDomainData] Export", from90, "→", to90, "for", distinctIds.length, "users");
 
+  // RISK: passing KEY_EVENTS as raw array — proxy must handle JSON.stringify (it does)
+  // Do NOT call JSON.stringify here — that would double-encode it
   const exportData = await mpCall("export", {
     from_date:    from90,
     to_date:      to90,
-    event:        KEY_EVENTS,   // raw array — proxy serializes to JSON string
-    distinct_ids: distinctIds,  // from Engage above
+    event:        KEY_EVENTS,
+    distinct_ids: distinctIds,
   });
 
-  const events = (exportData.results || []).sort((a, b) => (b.properties?.time ?? 0) - (a.properties?.time ?? 0));
-  console.log("[fetchDomainData] Export returned", events.length, "events");
+  // RISK: results missing or not array
+  const rawEvents = Array.isArray(exportData.results) ? exportData.results : [];
+  console.log("[fetchDomainData] Export raw events:", rawEvents.length);
 
-  // Last event
-  let lastEventData = null;
+  // RISK: events missing properties entirely — filter before sorting
+  const events = rawEvents
+    .filter(e => e && e.properties && typeof e.properties.time === "number")
+    .sort((a, b) => b.properties.time - a.properties.time);
+
+  console.log("[fetchDomainData] valid sorted events:", events.length);
+
+  // ── Last event ─────────────────────────────────────────────────────────────
+  let lastEvent = "No recent activity";
+  let lastUser  = "—";
+  let lastDate  = null;
+  let daysAgo   = null;
+
   if (events.length) {
     const e       = events[0];
-    const ts      = e.properties?.time;
-    const d       = ts ? new Date(ts * 1000).toISOString().slice(0, 10) : null;
+    const ts      = e.properties.time;
+    lastDate      = new Date(ts * 1000).toISOString().slice(0, 10);
+    daysAgo       = daysSince(lastDate);
+    lastEvent     = e.event || "Unknown event";
+
+    // Match back to profile for email — Export only has distinct_id
     const profile = profiles.find(p => p.$distinct_id === e.distinct_id);
-    const email   = profile?.$properties?.$email || profile?.$properties?.email || e.distinct_id;
-    lastEventData = { lastEvent: e.event, lastUser: email, lastDate: d, daysAgo: daysSince(d) };
+    const props   = profile?.$properties || {};
+    // RISK: email stored under different key names depending on Mixpanel setup
+    lastUser = props.$email || props.email || e.distinct_id || "—";
   }
 
-  // 30-day metrics
+  // ── 30-day metrics ─────────────────────────────────────────────────────────
   const from30ts   = Date.now() - 30 * 86400000;
-  const recent     = events.filter(e => (e.properties?.time ?? 0) * 1000 >= from30ts);
+  const recent     = events.filter(e => e.properties.time * 1000 >= from30ts);
   const eventCount = recent.length;
-  const eventMap   = {};
-  recent.forEach(e => { eventMap[e.event] = (eventMap[e.event] || 0) + 1; });
+
+  const eventMap = {};
+  recent.forEach(e => {
+    if (e.event) eventMap[e.event] = (eventMap[e.event] || 0) + 1;
+  });
   const topEvent = Object.entries(eventMap).sort((a, b) => b[1] - a[1])[0]?.[0] || "—";
 
-  return {
-    lastEvent:  lastEventData?.lastEvent || "No recent activity",
-    lastUser:   lastEventData?.lastUser  || "—",
-    lastDate:   lastEventData?.lastDate  || null,
-    daysAgo:    lastEventData?.daysAgo   ?? null,
-    eventCount,
-    topEvent,
-    newUsers,
-  };
+  return { lastEvent, lastUser, lastDate, daysAgo, eventCount, topEvent, newUsers };
 }
 
 // ── Components ────────────────────────────────────────────────────────────────
@@ -255,11 +309,15 @@ export default function App() {
       setLoadingMsg("Syncing " + c.name + "…");
       try {
         result[c.id] = await fetchDomainData(c.domains);
+        // Progressive update so first client shows while second loads
         setMpData(prev => ({ ...prev, [c.id]: result[c.id] }));
       } catch (e) {
-        console.error("Sync failed for", c.name, e);
+        console.error("Sync failed for", c.name, e.message);
         errors[c.id] = e.message;
-        result[c.id] = { lastEvent: "Sync error", lastUser: "—", lastDate: null, daysAgo: null, eventCount: 0, topEvent: "—", newUsers: 0 };
+        result[c.id] = {
+          lastEvent: "Sync error", lastUser: "—", lastDate: null,
+          daysAgo: null, eventCount: 0, topEvent: "—", newUsers: 0,
+        };
       }
     }
 
@@ -350,7 +408,7 @@ export default function App() {
       {Object.keys(syncErrors).length > 0 && !loading && (
         <div className="px-6 py-2 text-xs bg-red-900/20 border-b border-red-800/30">
           {clients.filter(c => syncErrors[c.id]).map(c => (
-            <div key={c.id} className="text-red-400">✗ {c.name}: {syncErrors[c.id]} — check Vercel logs</div>
+            <div key={c.id} className="text-red-400">✗ {c.name}: {syncErrors[c.id]}</div>
           ))}
         </div>
       )}
@@ -415,12 +473,12 @@ export default function App() {
                       ))}
                     </div>
 
-                    {c.todos.find(t => t.status !== "Done") ? (
+                    {nextTodo ? (
                       <div className="rounded-lg p-2 text-xs" style={{ backgroundColor: BG2 }}>
                         <div className="text-gray-500 text-[10px] mb-0.5">Next task</div>
                         <div className="flex items-center gap-1.5">
-                          <div className="w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ backgroundColor: PRIORITY[nextTodo?.priority] }} />
-                          <span className="text-gray-200 truncate">{nextTodo?.text}</span>
+                          <div className="w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ backgroundColor: PRIORITY[nextTodo.priority] }} />
+                          <span className="text-gray-200 truncate">{nextTodo.text}</span>
                         </div>
                       </div>
                     ) : (
