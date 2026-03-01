@@ -172,8 +172,9 @@ export default async function handler(req, res) {
       let where = "";
 
       if (domains?.length) {
-        // Best approach: filter by email domain directly — no user cap
-        where = domains.map(d => `properties["$email"] like "%@${d}"`).join(" or ");
+        // Export API uses has_suffix for string suffix matching (not like, not =~, not in)
+        // Wrapped in defined() guard to skip profiles with no email property
+        where = domains.map(d => `defined(properties["$email"]) and properties["$email"].has_suffix("@${d}")`).join(" or ");
       } else if (distinct_ids?.length) {
         // FIX: batch in groups of 200 to avoid URL length limits
         // Export where clause has no documented hard limit but ~200 IDs is safe
