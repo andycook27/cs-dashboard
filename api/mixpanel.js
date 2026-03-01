@@ -10,13 +10,13 @@ export default async function handler(req, res) {
   const projectId = process.env.MIXPANEL_PROJECT_ID;
 
   if (!username || !password || !projectId) {
-    return res.status(500).json({ error: "Missing env vars: MIXPANEL_SERVICE_ACCOUNT_USER, MIXPANEL_SERVICE_ACCOUNT_SECRET, MIXPANEL_PROJECT_ID" });
+    return res.status(500).json({ error: "Missing env vars" });
   }
 
   const auth    = Buffer.from(username + ":" + password).toString("base64");
   const headers = { Authorization: "Basic " + auth, Accept: "application/json" };
 
-  // ── Fetch helper with timeout ─────────────────────────────────────────────
+  // ── Fetch with timeout ────────────────────────────────────────────────────
   async function mpFetch(url, opts = {}, timeoutMs = 25000) {
     const ctrl = new AbortController();
     const tid  = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -26,94 +26,63 @@ export default async function handler(req, res) {
       return r;
     } catch (e) {
       clearTimeout(tid);
-      if (e.name === "AbortError") throw new Error("Mixpanel request timed out after " + timeoutMs / 1000 + "s");
+      if (e.name === "AbortError") throw new Error("Mixpanel timed out after " + timeoutMs / 1000 + "s");
       throw e;
     }
   }
 
-  // ── GET: debug endpoint ───────────────────────────────────────────────────
+  // ── GET: debug ────────────────────────────────────────────────────────────
   if (req.method === "GET") {
     const { debug, domain } = req.query;
-
-    if (!debug) {
-      return res.status(200).json({ status: "ok", hasUser: !!username, hasSecret: !!password, hasProjectId: !!projectId });
-    }
+    if (!debug) return res.status(200).json({ status: "ok", hasUser: !!username, hasSecret: !!password, hasProjectId: !!projectId });
 
     if (debug === "engage") {
       try {
         const domains = (domain || "sitemarker.com").split(",").map(d => d.trim()).filter(Boolean);
-        // FIX: Engage uses "in" operator for substring match (not =~, not like)
         const where   = domains.map(d => `"@${d}" in properties["$email"]`).join(" or ");
-        const body    = new URLSearchParams({ where, project_id: projectId });
         const r       = await mpFetch("https://mixpanel.com/api/2.0/engage", {
           method:  "POST",
           headers: { ...headers, "Content-Type": "application/x-www-form-urlencoded" },
-          body:    body.toString(),
+          body:    new URLSearchParams({ where, project_id: projectId }).toString(),
         });
-        const text = await r.text();
-        console.log("Debug engage status:", r.status, text.slice(0, 500));
-        return res.status(r.status).send(text);
-      } catch (e) {
-        return res.status(500).json({ error: e.message });
-      }
+        return res.status(r.status).send(await r.text());
+      } catch (e) { return res.status(500).json({ error: e.message }); }
     }
 
     if (debug === "export") {
       try {
         const to   = new Date().toISOString().slice(0, 10);
         const from = new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10);
-        // FIX: event must be a JSON array string; project_id goes in query string for Export
-        const qs   = new URLSearchParams({
-          from_date:  from,
-          to_date:    to,
-          project_id: projectId,
-          event:      JSON.stringify(["User Signed In"]),
-        }).toString();
-        const r    = await mpFetch("https://data.mixpanel.com/api/2.0/export?" + qs, {
-          headers: { ...headers, Accept: "text/plain" },
-        });
-        const text = await r.text();
-        console.log("Debug export status:", r.status, text.slice(0, 500));
-        return res.status(r.status).send(text.slice(0, 3000));
-      } catch (e) {
-        return res.status(500).json({ error: e.message });
-      }
+        const qs   = new URLSearchParams({ from_date: from, to_date: to, project_id: projectId, event: JSON.stringify(["User Signed In"]) }).toString();
+        const r    = await mpFetch("https://data.mixpanel.com/api/2.0/export?" + qs, { headers: { ...headers, Accept: "text/plain" } });
+        return res.status(r.status).send((await r.text()).slice(0, 3000));
+      } catch (e) { return res.status(500).json({ error: e.message }); }
     }
 
-    return res.status(400).json({ error: "Unknown debug type. Use ?debug=engage or ?debug=export" });
+    return res.status(400).json({ error: "Unknown debug type" });
   }
 
-  // ── POST: normal proxy ────────────────────────────────────────────────────
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
   const { endpoint, params } = req.body;
+  console.log("POST endpoint:", endpoint, "params keys:", Object.keys(params || {}));
 
   try {
 
     // ── ENGAGE ──────────────────────────────────────────────────────────────
     if (endpoint === "engage") {
       const domains = Array.isArray(params.domain) ? params.domain : [params.domain];
-
-      // FIX: Engage selector uses "in" for substring match — verified working syntax
-      const where = domains.map(d => `"@${d}" in properties["$email"]`).join(" or ");
+      const where   = domains.map(d => `"@${d}" in properties["$email"]`).join(" or ");
 
       let allResults = [];
       let sessionId  = null;
       let page       = 0;
 
       while (true) {
-        const bodyObj = {
-          where,
-          project_id: projectId,
-          // FIX: page_size default is 1000 — set explicitly to avoid undocumented limits
-          page_size: 1000,
-        };
-
-        // FIX: only add session_id + page after first successful page
-        // session_id must be present for pages > 0; page must be an integer (not string)
+        const bodyObj = { where, project_id: projectId, page_size: 1000 };
         if (sessionId !== null) {
           bodyObj.session_id = sessionId;
-          bodyObj.page       = page; // integer, not String(page)
+          bodyObj.page       = page;
         }
 
         let r, text;
@@ -124,39 +93,26 @@ export default async function handler(req, res) {
             body:    new URLSearchParams(bodyObj).toString(),
           });
           text = await r.text();
-        } catch (fetchErr) {
-          return res.status(500).json({ error: "Engage fetch failed: " + fetchErr.message });
+        } catch (e) {
+          return res.status(500).json({ error: "Engage fetch error: " + e.message });
         }
 
         console.log("Engage page", page, "status:", r.status, "body:", text.slice(0, 400));
-
-        if (!r.ok) {
-          return res.status(r.status).json({ error: "Engage failed", status: r.status, body: text.slice(0, 500) });
-        }
+        if (!r.ok) return res.status(r.status).json({ error: "Engage failed", body: text.slice(0, 500) });
 
         let data;
         try { data = JSON.parse(text); } catch {
-          return res.status(500).json({ error: "Engage response not valid JSON", raw: text.slice(0, 300) });
+          return res.status(500).json({ error: "Engage invalid JSON", raw: text.slice(0, 300) });
         }
 
-        if (!Array.isArray(data.results)) break;
-        if (data.results.length === 0) break;
-
+        if (!Array.isArray(data.results) || data.results.length === 0) break;
         allResults = allResults.concat(data.results);
         console.log("Engage accumulated:", allResults.length, "of", data.total);
 
-        // FIX: always capture session_id (not just on first page)
         if (data.session_id) sessionId = data.session_id;
-
-        // Done if we have everything
         if (allResults.length >= data.total) break;
-
-        // Safety valve
         page++;
-        if (page > 50) {
-          console.warn("Engage hit page safety limit (50). Results may be incomplete.");
-          break;
-        }
+        if (page > 50) { console.warn("Engage page safety limit hit"); break; }
       }
 
       return res.status(200).json({ results: allResults, total: allResults.length });
@@ -164,73 +120,54 @@ export default async function handler(req, res) {
 
     // ── EXPORT ──────────────────────────────────────────────────────────────
     if (endpoint === "export") {
-      const { from_date, to_date, event, distinct_ids, domains } = params;
+      const { from_date, to_date, event, distinct_ids } = params;
 
-      // FIX: Build where clause using domain-based filter OR distinct_id list
-      // Export API supports standard JQL "like" operator (unlike Engage)
-      // Prefer domain filter when available — avoids the 50-user cap entirely
+      console.log("Export params — from:", from_date, "to:", to_date, "events:", event?.length, "distinct_ids:", distinct_ids?.length);
+
+      // Build where clause from distinct_ids (provided by Engage)
       let where = "";
-
       if (distinct_ids?.length) {
-        // Use distinct_ids from Engage — batch into chunks of 100 to stay within
-        // URL length limits. Export where clause: distinct_id == "x" or distinct_id == "y"
         const ids     = distinct_ids.slice(0, 100);
-        const clauses = ids.map(id => `distinct_id == "${id.replace(/"/g, '\\"')}"`).join(" or ");
-        where         = `(${clauses})`;
-        if (distinct_ids.length > 100) {
-          console.warn("distinct_ids truncated from", distinct_ids.length, "to 100 — consider paginating");
-        }
+        const clauses = ids.map(id => `distinct_id == "${String(id).replace(/"/g, '\\"')}"`).join(" or ");
+        where         = "(" + clauses + ")";
+        if (distinct_ids.length > 100) console.warn("distinct_ids truncated to 100 from", distinct_ids.length);
       }
 
-      // FIX: event must be serialized as JSON array string by the proxy, not the caller
-      // Accepts either a raw array or an already-stringified array (handle both)
-      let eventParam;
-      if (Array.isArray(event)) {
-        eventParam = JSON.stringify(event);
-      } else if (typeof event === "string") {
-        // Validate it's already a JSON array to avoid double-encoding
-        try {
-          const parsed = JSON.parse(event);
-          eventParam   = Array.isArray(parsed) ? event : JSON.stringify([event]);
-        } catch {
-          eventParam = JSON.stringify([event]);
-        }
+      // event: accept raw array or pre-stringified — normalize to JSON string
+      let eventStr;
+      if (Array.isArray(event))        eventStr = JSON.stringify(event);
+      else if (typeof event === "string") {
+        try { eventStr = Array.isArray(JSON.parse(event)) ? event : JSON.stringify([event]); }
+        catch { eventStr = JSON.stringify([event]); }
       }
 
       const exportParams = { from_date, to_date, project_id: projectId };
-      if (eventParam) exportParams.event = eventParam;
-      if (where)      exportParams.where = where;
+      if (eventStr) exportParams.event = eventStr;
+      if (where)    exportParams.where = where;
 
       const qs  = new URLSearchParams(exportParams).toString();
       const url = "https://data.mixpanel.com/api/2.0/export?" + qs;
-      console.log("Export URL:", url.slice(0, 400));
+      console.log("Export URL:", url.slice(0, 500));
 
       let r, text;
       try {
         r    = await mpFetch(url, { headers: { ...headers, Accept: "text/plain" } });
         text = await r.text();
-      } catch (fetchErr) {
-        return res.status(500).json({ error: "Export fetch failed: " + fetchErr.message });
+      } catch (e) {
+        return res.status(500).json({ error: "Export fetch error: " + e.message });
       }
 
-      console.log("Export status:", r.status, "| preview:", text.slice(0, 400));
-
-      if (!r.ok) {
-        return res.status(r.status).json({ error: "Export failed", status: r.status, body: text.slice(0, 500) });
-      }
-
-      // FIX: Export returns newline-delimited JSON — handle empty response gracefully
-      if (!text.trim()) {
-        return res.status(200).json({ results: [] });
-      }
+      console.log("Export status:", r.status, "preview:", text.slice(0, 400));
+      if (!r.ok) return res.status(r.status).json({ error: "Export failed", status: r.status, body: text.slice(0, 500) });
+      if (!text.trim()) return res.status(200).json({ results: [] });
 
       const lines  = text.trim().split("\n").filter(Boolean);
       const parsed = [];
       for (const l of lines) {
-        try { parsed.push(JSON.parse(l)); } catch { console.warn("Skipped unparseable Export line:", l.slice(0, 100)); }
+        try { parsed.push(JSON.parse(l)); } catch { console.warn("Skipped bad Export line:", l.slice(0, 80)); }
       }
 
-      console.log("Export events parsed:", parsed.length, "of", lines.length, "lines");
+      console.log("Export parsed:", parsed.length, "events from", lines.length, "lines");
       return res.status(200).json({ results: parsed });
     }
 

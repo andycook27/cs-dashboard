@@ -13,8 +13,7 @@ const BG0 = "#0a0a0a", BG1 = "#111111", BG2 = "#1a1a1a", BG3 = "#2a2a2a", BRD = 
 const COOLDOWN_MS = 30 * 60 * 1000;
 const CACHE_KEY   = "mp_cache_v1";
 
-// FIX: Event names are case-sensitive and whitespace-sensitive in Mixpanel.
-// These must exactly match what your app tracks — verify against Mixpanel Lexicon.
+// These must exactly match event names in Mixpanel Lexicon (case-sensitive)
 const KEY_EVENTS = [
   "User Signed In",
   "Project Created",
@@ -45,8 +44,8 @@ function getHealth(d) {
   return "Inactive";
 }
 function healthColor(h) {
-  if (h === "Healthy")  return BRAND;
-  if (h === "At Risk")  return "#facc15";
+  if (h === "Healthy") return BRAND;
+  if (h === "At Risk") return "#facc15";
   return "#f87171";
 }
 function daysSince(dateStr) {
@@ -67,14 +66,11 @@ function timeAgo(ts) {
   return Math.floor(hrs / 24) + "d ago";
 }
 
-// ── Cache helpers ────────────────────────────────────────────────────────────
+// ── Cache ─────────────────────────────────────────────────────────────────────
 let memCache = null;
 function loadCache() {
   if (memCache) return memCache;
-  try {
-    const raw = sessionStorage.getItem(CACHE_KEY);
-    if (raw) { memCache = JSON.parse(raw); return memCache; }
-  } catch {}
+  try { const r = sessionStorage.getItem(CACHE_KEY); if (r) { memCache = JSON.parse(r); return memCache; } } catch {}
   return null;
 }
 function saveCache(data) {
@@ -82,87 +78,76 @@ function saveCache(data) {
   try { sessionStorage.setItem(CACHE_KEY, JSON.stringify(data)); } catch {}
 }
 
-// ── Mixpanel API proxy call ──────────────────────────────────────────────────
+// ── API proxy ─────────────────────────────────────────────────────────────────
 async function mpCall(endpoint, params) {
-  const res = await fetch("/api/mixpanel", {
+  console.log("mpCall →", endpoint, JSON.stringify(params).slice(0, 200));
+  const res  = await fetch("/api/mixpanel", {
     method:  "POST",
     headers: { "Content-Type": "application/json" },
     body:    JSON.stringify({ endpoint, params }),
   });
   const data = await res.json();
+  console.log("mpCall ←", endpoint, "status:", res.status, "keys:", Object.keys(data));
   if (!res.ok) throw new Error(data.error || data.body || "API error " + res.status);
   return data;
 }
 
-// ── Main data fetch per client ───────────────────────────────────────────────
+// ── Core fetch logic ──────────────────────────────────────────────────────────
 async function fetchDomainData(domains) {
 
-  // ── Call 1: Engage — get all user profiles for these domains ──────────────
+  // Step 1: Engage → get all profiles for these domains
+  console.log("[fetchDomainData] Starting Engage for domains:", domains);
   const engageData = await mpCall("engage", { domain: domains });
   const profiles   = engageData.results || [];
+  console.log("[fetchDomainData] Engage returned", profiles.length, "profiles");
 
   if (!profiles.length) {
-    return {
-      lastEvent: "No users found", lastUser: "—", lastDate: null,
-      daysAgo: null, eventCount: 0, topEvent: "—", newUsers: 0,
-    };
+    return { lastEvent: "No users found", lastUser: "—", lastDate: null, daysAgo: null, eventCount: 0, topEvent: "—", newUsers: 0 };
   }
 
-  // FIX: Count new users — check multiple possible created date property names
-  // Mixpanel sets $created automatically; custom props vary by implementation
+  // Extract distinct_ids for Export filter
+  const distinctIds = profiles.map(p => p.$distinct_id).filter(Boolean);
+  console.log("[fetchDomainData] distinct_ids count:", distinctIds.length);
+
+  // Count new users this month
   const mtdStart = new Date(new Date().getFullYear(), new Date().getMonth(), 1).getTime();
   const newUsers  = profiles.filter(p => {
-    const created = p.$properties?.$created
-      || p.$properties?.created
-      || p.$properties?.created_at
-      || p.$properties?.$last_seen; // fallback if no created date
+    const created = p.$properties?.$created || p.$properties?.created || p.$properties?.created_at;
     return created && new Date(created).getTime() >= mtdStart;
   }).length;
 
-  // ── Call 2: Export — filter by domain directly (no user cap) ─────────────
-  // FIX: Pass domains to the proxy so Export uses a "like" where clause instead
-  // of a distinct_id list — this removes the 50/200 user cap entirely and
-  // ensures we always get the full picture regardless of profile count.
+  // Step 2: Export → get events for those users
   const to90   = new Date().toISOString().slice(0, 10);
   const from90 = new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10);
 
-  // FIX: Pass KEY_EVENTS as a raw array — proxy handles JSON.stringify
-  // Previously this was double-serialized causing silent 0 event returns
-  // Use distinct_ids from Engage for the Export where clause.
-  // Domain-based string filtering is not reliably supported by the Export API.
-  // Engage already gave us the exact user list for these domains.
+  console.log("[fetchDomainData] Starting Export, date range:", from90, "→", to90, "ids:", distinctIds.length);
+
   const exportData = await mpCall("export", {
     from_date:    from90,
     to_date:      to90,
-    event:        KEY_EVENTS,   // raw array, proxy handles JSON.stringify
-    distinct_ids: distinctIds,  // from Engage results above
+    event:        KEY_EVENTS,   // raw array — proxy serializes to JSON string
+    distinct_ids: distinctIds,  // from Engage above
   });
 
-  const events = (exportData.results || [])
-    .sort((a, b) => (b.properties?.time ?? 0) - (a.properties?.time ?? 0));
+  const events = (exportData.results || []).sort((a, b) => (b.properties?.time ?? 0) - (a.properties?.time ?? 0));
+  console.log("[fetchDomainData] Export returned", events.length, "events");
 
-  // ── Last event ────────────────────────────────────────────────────────────
+  // Last event
   let lastEventData = null;
   if (events.length) {
     const e       = events[0];
     const ts      = e.properties?.time;
     const d       = ts ? new Date(ts * 1000).toISOString().slice(0, 10) : null;
-    // Match event back to a profile for the email — Export only has distinct_id
     const profile = profiles.find(p => p.$distinct_id === e.distinct_id);
-    const email   = profile?.$properties?.$email
-      || profile?.$properties?.email
-      || e.properties?.distinct_id
-      || e.distinct_id;
+    const email   = profile?.$properties?.$email || profile?.$properties?.email || e.distinct_id;
     lastEventData = { lastEvent: e.event, lastUser: email, lastDate: d, daysAgo: daysSince(d) };
   }
 
-  // ── 30-day event count ────────────────────────────────────────────────────
+  // 30-day metrics
   const from30ts   = Date.now() - 30 * 86400000;
   const recent     = events.filter(e => (e.properties?.time ?? 0) * 1000 >= from30ts);
   const eventCount = recent.length;
-
-  // ── Top event (30d) ───────────────────────────────────────────────────────
-  const eventMap = {};
+  const eventMap   = {};
   recent.forEach(e => { eventMap[e.event] = (eventMap[e.event] || 0) + 1; });
   const topEvent = Object.entries(eventMap).sort((a, b) => b[1] - a[1])[0]?.[0] || "—";
 
@@ -177,7 +162,7 @@ async function fetchDomainData(domains) {
   };
 }
 
-// ── Sub-components ───────────────────────────────────────────────────────────
+// ── Components ────────────────────────────────────────────────────────────────
 function StatusBadge({ status }) {
   if (status === "In Progress")
     return <span className="text-[11px] px-2 py-0.5 rounded-full font-medium text-black" style={{ backgroundColor: BRAND }}>{status}</span>;
@@ -196,32 +181,21 @@ function Logo() {
 }
 
 function Spinner() {
-  return (
-    <div className="w-4 h-4 border-2 border-black/30 rounded-full animate-spin" style={{ borderTopColor: "#000" }} />
-  );
+  return <div className="w-4 h-4 border-2 border-black/30 rounded-full animate-spin" style={{ borderTopColor: "#000" }} />;
 }
 
-// ── Domain Tag Input ─────────────────────────────────────────────────────────
 function DomainTagInput({ domains, onChange }) {
   const [input, setInput] = useState("");
-
-  const addDomain = () => {
+  const add = () => {
     const val = input.trim().toLowerCase().replace(/^@/, "").replace(/^https?:\/\//, "");
     if (val && !domains.includes(val)) onChange([...domains, val]);
     setInput("");
   };
-
-  const removeDomain = d => onChange(domains.filter(x => x !== d));
-
+  const remove = d => onChange(domains.filter(x => x !== d));
   const onKeyDown = e => {
-    if (e.key === "Enter" || e.key === "," || e.key === "Tab") {
-      e.preventDefault();
-      addDomain();
-    } else if (e.key === "Backspace" && !input && domains.length) {
-      removeDomain(domains[domains.length - 1]);
-    }
+    if (["Enter", ",", "Tab"].includes(e.key)) { e.preventDefault(); add(); }
+    else if (e.key === "Backspace" && !input && domains.length) remove(domains[domains.length - 1]);
   };
-
   return (
     <div className="rounded-lg px-2 py-1.5 flex flex-wrap gap-1 items-center min-h-[36px] cursor-text"
       style={{ backgroundColor: BG2, border: "1px solid " + BG3 }}
@@ -230,31 +204,26 @@ function DomainTagInput({ domains, onChange }) {
         <span key={d} className="flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full font-medium"
           style={{ backgroundColor: BRAND + "25", color: BRAND, border: "1px solid " + BRAND + "50" }}>
           {d}
-          <button onClick={() => removeDomain(d)} className="hover:text-white leading-none ml-0.5">×</button>
+          <button onClick={() => remove(d)} className="hover:text-white leading-none ml-0.5">×</button>
         </span>
       ))}
-      <input
-        value={input}
-        onChange={e => setInput(e.target.value)}
-        onKeyDown={onKeyDown}
-        onBlur={addDomain}
+      <input value={input} onChange={e => setInput(e.target.value)} onKeyDown={onKeyDown} onBlur={add}
         placeholder={domains.length ? "" : "domain.com — press Enter to add"}
-        className="flex-1 min-w-[140px] bg-transparent text-xs text-white focus:outline-none placeholder-gray-600"
-      />
+        className="flex-1 min-w-[140px] bg-transparent text-xs text-white focus:outline-none placeholder-gray-600" />
     </div>
   );
 }
 
 const inputStyle = { backgroundColor: BG2, border: "1px solid " + BG3, color: "white" };
 
-// ── Main App ─────────────────────────────────────────────────────────────────
+// ── App ───────────────────────────────────────────────────────────────────────
 export default function App() {
   const [clients, setClients]               = useState(DEFAULT_CLIENTS);
   const [mpData, setMpData]                 = useState({});
   const [loading, setLoading]               = useState(false);
   const [loadingMsg, setLoadingMsg]         = useState("");
   const [lastSynced, setLastSynced]         = useState(null);
-  const [syncErrors, setSyncErrors]         = useState({});   // FIX: per-client errors
+  const [syncErrors, setSyncErrors]         = useState({});
   const [selected, setSelected]             = useState(null);
   const [filter, setFilter]                 = useState("All");
   const [activeTab, setActiveTab]           = useState("overview");
@@ -265,10 +234,7 @@ export default function App() {
 
   useEffect(() => {
     const cache = loadCache();
-    if (cache) {
-      setMpData(cache.data || {});
-      setLastSynced(cache.ts || null);
-    }
+    if (cache) { setMpData(cache.data || {}); setLastSynced(cache.ts || null); }
   }, []);
 
   const client   = selected !== null ? clients.find(c => c.id === selected) : null;
@@ -289,14 +255,11 @@ export default function App() {
       setLoadingMsg("Syncing " + c.name + "…");
       try {
         result[c.id] = await fetchDomainData(c.domains);
-        setMpData(prev => ({ ...prev, [c.id]: result[c.id] })); // progressive update
+        setMpData(prev => ({ ...prev, [c.id]: result[c.id] }));
       } catch (e) {
-        console.error("Failed for", c.name, e.message);
+        console.error("Sync failed for", c.name, e);
         errors[c.id] = e.message;
-        result[c.id] = {
-          lastEvent: "Sync error", lastUser: "—", lastDate: null,
-          daysAgo: null, eventCount: 0, topEvent: "—", newUsers: 0,
-        };
+        result[c.id] = { lastEvent: "Sync error", lastUser: "—", lastDate: null, daysAgo: null, eventCount: 0, topEvent: "—", newUsers: 0 };
       }
     }
 
@@ -333,12 +296,10 @@ export default function App() {
     openTodos: clients.reduce((s, c) => s + c.todos.filter(t => t.status !== "Done").length, 0),
   };
 
-  const anyError = Object.keys(syncErrors).length > 0;
-
   return (
     <div className="min-h-screen text-gray-100 font-sans" style={{ backgroundColor: BG0 }}>
 
-      {/* ── Header ── */}
+      {/* Header */}
       <div className="border-b px-6 py-4 flex items-center justify-between" style={{ backgroundColor: BG1, borderColor: BRD }}>
         <div className="flex items-center gap-6">
           <Logo />
@@ -380,20 +341,16 @@ export default function App() {
         </div>
       </div>
 
-      {/* Loading banner */}
       {loading && (
         <div className="px-6 py-2 text-xs text-center" style={{ backgroundColor: BRAND + "15", borderBottom: "1px solid " + BRAND + "30", color: BRAND }}>
           {loadingMsg}
         </div>
       )}
 
-      {/* FIX: Per-client error banners instead of one overwriting the other */}
-      {anyError && !loading && (
+      {Object.keys(syncErrors).length > 0 && !loading && (
         <div className="px-6 py-2 text-xs bg-red-900/20 border-b border-red-800/30">
           {clients.filter(c => syncErrors[c.id]).map(c => (
-            <div key={c.id} className="text-red-400">
-              ✗ {c.name}: {syncErrors[c.id]} — check Vercel logs for details
-            </div>
+            <div key={c.id} className="text-red-400">✗ {c.name}: {syncErrors[c.id]} — check Vercel logs</div>
           ))}
         </div>
       )}
@@ -412,12 +369,11 @@ export default function App() {
 
           <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
             {filtered.map(c => {
-              const h            = getHealth(c.daysAgo);
-              const hcol         = healthColor(h);
-              const openCount    = c.todos.filter(t => t.status !== "Done").length;
-              const nextTodo     = c.todos.find(t => t.status !== "Done");
-              const domainDisplay = (c.domains || []).join(", ");
-              const hasError     = !!syncErrors[c.id];
+              const h         = getHealth(c.daysAgo);
+              const hcol      = healthColor(h);
+              const openCount = c.todos.filter(t => t.status !== "Done").length;
+              const nextTodo  = c.todos.find(t => t.status !== "Done");
+              const hasError  = !!syncErrors[c.id];
               return (
                 <div key={c.id} onClick={() => { setSelected(c.id); setActiveTab("overview"); }}
                   className="rounded-xl border cursor-pointer transition-all group"
@@ -426,13 +382,13 @@ export default function App() {
                     <div className="flex items-start justify-between mb-3">
                       <div>
                         <div className="flex items-center gap-2">
-                          <h2 className="font-semibold text-white text-base group-hover:opacity-80 transition-opacity">{c.name}</h2>
+                          <h2 className="font-semibold text-white text-base group-hover:opacity-80">{c.name}</h2>
                           <span className={"text-[10px] px-1.5 py-0.5 rounded font-medium " + TIER_BADGE[c.tier]}>{c.tier}</span>
                         </div>
                         <div className="flex items-center gap-1.5 mt-1">
                           <div className="w-2 h-2 rounded-full" style={{ backgroundColor: hcol }} />
                           <span className="text-xs font-medium" style={{ color: hcol }}>{h}</span>
-                          <span className="text-[10px] text-gray-600 truncate max-w-[160px]">· {domainDisplay}</span>
+                          <span className="text-[10px] text-gray-600 truncate max-w-[160px]">· {(c.domains || []).join(", ")}</span>
                         </div>
                       </div>
                       {openCount > 0 && (
@@ -459,12 +415,12 @@ export default function App() {
                       ))}
                     </div>
 
-                    {nextTodo ? (
+                    {c.todos.find(t => t.status !== "Done") ? (
                       <div className="rounded-lg p-2 text-xs" style={{ backgroundColor: BG2 }}>
                         <div className="text-gray-500 text-[10px] mb-0.5">Next task</div>
                         <div className="flex items-center gap-1.5">
-                          <div className="w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ backgroundColor: PRIORITY[nextTodo.priority] }} />
-                          <span className="text-gray-200 truncate">{nextTodo.text}</span>
+                          <div className="w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ backgroundColor: PRIORITY[nextTodo?.priority] }} />
+                          <span className="text-gray-200 truncate">{nextTodo?.text}</span>
                         </div>
                       </div>
                     ) : (
@@ -495,14 +451,10 @@ export default function App() {
                 </span>
                 {(client.domains || []).map(d => (
                   <span key={d} className="text-[11px] px-2 py-0.5 rounded-full"
-                    style={{ backgroundColor: BG2, color: "#9ca3af", border: "1px solid " + BG3 }}>
-                    {d}
-                  </span>
+                    style={{ backgroundColor: BG2, color: "#9ca3af", border: "1px solid " + BG3 }}>{d}</span>
                 ))}
               </div>
-              {syncErrors[client.id] && (
-                <div className="text-xs text-red-400 mt-1">⚠ Last sync error: {syncErrors[client.id]}</div>
-              )}
+              {syncErrors[client.id] && <div className="text-xs text-red-400 mt-1">⚠ {syncErrors[client.id]}</div>}
             </div>
           </div>
 
@@ -596,7 +548,7 @@ export default function App() {
         </div>
       )}
 
-      {/* ── Todo Modal ── */}
+      {/* Todo Modal */}
       {todoModal && (
         <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4">
           <div className="rounded-2xl w-full max-w-md p-6" style={{ backgroundColor: BG1, border: "1px solid " + BG3 }}>
@@ -644,7 +596,7 @@ export default function App() {
         </div>
       )}
 
-      {/* ── Client Settings Modal ── */}
+      {/* Settings Modal */}
       {settingsOpen && (
         <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4">
           <div className="rounded-2xl w-full max-w-lg p-6 max-h-[80vh] overflow-y-auto" style={{ backgroundColor: BG1, border: "1px solid " + BG3 }}>
