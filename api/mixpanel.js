@@ -179,82 +179,78 @@ export default async function handler(req, res) {
 
       console.log("Export params — from:", from_date, "to:", to_date, "events:", Array.isArray(event) ? event.length : event, "distinct_ids:", distinct_ids?.length);
 
-      // Build where clause from distinct_ids
-      // RISK: very large ID lists — POST body handles this, no URL length limit
-      let where = "";
-      if (distinct_ids?.length) {
-        // RISK: distinct_ids might contain non-string values or values with quotes
-        const ids     = distinct_ids.slice(0, 500).map(id => String(id).replace(/"/g, '\\"'));
-        where         = "(" + ids.map(id => `distinct_id == "${id}"`).join(" or ") + ")";
-        if (distinct_ids.length > 500) console.warn("distinct_ids truncated to 500 from", distinct_ids.length);
-      }
-
-      // RISK: event param double-serialization — normalize regardless of what caller sends
+      // Normalize event param — accept raw array or pre-stringified
       let eventStr;
       if (Array.isArray(event)) {
-        // RISK: empty array would return ALL events — guard against it
-        if (event.length === 0) {
-          return res.status(400).json({ error: "Export: event array is empty" });
-        }
+        if (event.length === 0) return res.status(400).json({ error: "Export: event array is empty" });
         eventStr = JSON.stringify(event);
       } else if (typeof event === "string" && event.trim()) {
         try {
-          const parsed = JSON.parse(event);
-          eventStr     = Array.isArray(parsed) ? event : JSON.stringify([event]);
-        } catch {
-          eventStr = JSON.stringify([event]);
-        }
+          const p = JSON.parse(event);
+          eventStr = Array.isArray(p) ? event : JSON.stringify([event]);
+        } catch { eventStr = JSON.stringify([event]); }
       }
-      // RISK: no event filter = Export returns ALL events for the project — very slow/large
-      if (!eventStr) {
-        console.warn("Export: no event filter provided — this may return a very large response");
-      }
+      if (!eventStr) console.warn("Export: no event filter — may return very large response");
 
-      const exportParams = { from_date, to_date, project_id: projectId };
-      if (eventStr) exportParams.event = eventStr;
-      if (where)    exportParams.where = where;
-
-      // RISK: GET request fails with large where clause due to URL length limits
-      // Always POST to avoid this — Export API supports POST with form body
-      const exportBody = new URLSearchParams(exportParams).toString();
-      console.log("Export body length:", exportBody.length, "| where length:", where.length);
-
-      let r, text;
-      try {
-        r    = await mpFetch("https://data.mixpanel.com/api/2.0/export", {
+      // Helper: run one Export request for a given where clause
+      async function runExport(where) {
+        const exportParams = { from_date, to_date, project_id: projectId };
+        if (eventStr) exportParams.event = eventStr;
+        if (where)    exportParams.where = where;
+        const body = new URLSearchParams(exportParams).toString();
+        console.log("Export batch body length:", body.length, "| where length:", (where || "").length);
+        const r    = await mpFetch("https://data.mixpanel.com/api/2.0/export", {
           method:  "POST",
           headers: { ...headers, "Content-Type": "application/x-www-form-urlencoded", Accept: "text/plain" },
-          body:    exportBody,
+          body,
         });
-        text = await r.text();
-      } catch (e) {
-        return res.status(500).json({ error: "Export fetch error: " + e.message });
+        const text = await r.text();
+        console.log("Export batch status:", r.status, "| preview:", text.slice(0, 200));
+        if (!r.ok) throw new Error("Export batch failed (" + r.status + "): " + text.slice(0, 300));
+        return text;
       }
 
-      console.log("Export status:", r.status, "| preview:", text.slice(0, 400));
+      // Chunk distinct_ids into batches of 50 to stay within Mixpanel's
+      // expression complexity limit (~50 OR clauses is safe)
+      const BATCH = 50;
+      const ids   = (distinct_ids || []).slice(0, 500).map(id => String(id).replace(/"/g, '\\"'));
+      const chunks = [];
+      for (let i = 0; i < ids.length; i += BATCH) chunks.push(ids.slice(i, i + BATCH));
+      if (ids.length > 500) console.warn("distinct_ids capped at 500 from", distinct_ids.length);
 
-      if (!r.ok) return res.status(r.status).json({ error: "Export failed", status: r.status, body: text.slice(0, 500) });
+      console.log("Export: running", chunks.length, "batch(es) of up to", BATCH, "IDs");
 
-      // RISK: empty response is valid (no events in range) — don't treat as error
-      if (!text || !text.trim()) {
-        console.log("Export returned empty response — no events in range");
-        return res.status(200).json({ results: [] });
+      let allLines = [];
+      if (chunks.length === 0) {
+        // No ID filter — fetch without where clause
+        try {
+          const text = await runExport("");
+          if (text?.trim()) allLines = text.trim().split("\n").filter(Boolean);
+        } catch (e) {
+          return res.status(500).json({ error: e.message });
+        }
+      } else {
+        for (const chunk of chunks) {
+          const where = "(" + chunk.map(id => `distinct_id == "${id}"`).join(" or ") + ")";
+          try {
+            const text = await runExport(where);
+            if (text?.trim()) allLines.push(...text.trim().split("\n").filter(Boolean));
+          } catch (e) {
+            console.error("Export chunk failed:", e.message);
+            // Continue with remaining chunks rather than failing entirely
+          }
+        }
       }
 
-      // RISK: Export returns newline-delimited JSON, not a JSON array
-      // Each line is a separate JSON object — malformed lines must be skipped gracefully
-      const lines  = text.trim().split("\n").filter(Boolean);
       const parsed = [];
-      let   bad    = 0;
-      for (const l of lines) {
+      let bad = 0;
+      for (const l of allLines) {
         try { parsed.push(JSON.parse(l)); } catch { bad++; }
       }
-      if (bad > 0) console.warn("Export skipped", bad, "unparseable lines out of", lines.length);
+      if (bad > 0) console.warn("Export skipped", bad, "unparseable lines");
 
-      // RISK: events missing properties.time — sort defensively
       parsed.sort((a, b) => (b.properties?.time ?? 0) - (a.properties?.time ?? 0));
-
-      console.log("Export parsed:", parsed.length, "events from", lines.length, "lines");
+      console.log("Export total parsed:", parsed.length, "events from", allLines.length, "lines across", chunks.length || 1, "batch(es)");
       return res.status(200).json({ results: parsed });
     }
 
