@@ -10,8 +10,9 @@ const STATUS_COLORS = {
   "Blocked":     "bg-red-800 text-red-100",
 };
 const BG0 = "#0a0a0a", BG1 = "#111111", BG2 = "#1a1a1a", BG3 = "#2a2a2a", BRD = "#222222";
-const COOLDOWN_MS = 30 * 60 * 1000;
-const CACHE_KEY   = "mp_cache_v1";
+const COOLDOWN_MS  = 30 * 60 * 1000;
+const CACHE_KEY    = "mp_cache_v1";
+const CLIENTS_KEY  = "cs_clients_v1";
 
 // Must exactly match Mixpanel Lexicon event names (case-sensitive, whitespace-sensitive)
 const KEY_EVENTS = [
@@ -71,14 +72,17 @@ let memCache = null;
 function loadCache() {
   if (memCache) return memCache;
   try {
-    const r = sessionStorage.getItem(CACHE_KEY);
+    const r = localStorage.getItem(CACHE_KEY);
     if (r) { memCache = JSON.parse(r); return memCache; }
   } catch {}
   return null;
 }
 function saveCache(data) {
   memCache = data;
-  try { sessionStorage.setItem(CACHE_KEY, JSON.stringify(data)); } catch {}
+  try {
+    if (data) localStorage.setItem(CACHE_KEY, JSON.stringify(data));
+    else localStorage.removeItem(CACHE_KEY);
+  } catch {}
 }
 
 // ── API proxy call ────────────────────────────────────────────────────────────
@@ -272,7 +276,13 @@ const inputStyle = { backgroundColor: BG2, border: "1px solid " + BG3, color: "w
 
 // ── App ───────────────────────────────────────────────────────────────────────
 export default function App() {
-  const [clients, setClients]               = useState(DEFAULT_CLIENTS);
+  const [clients, setClients]               = useState(() => {
+    try {
+      const saved = localStorage.getItem(CLIENTS_KEY);
+      if (saved) return JSON.parse(saved);
+    } catch {}
+    return DEFAULT_CLIENTS;
+  });
   const [mpData, setMpData]                 = useState({});
   const [loading, setLoading]               = useState(false);
   const [loadingMsg, setLoadingMsg]         = useState("");
@@ -291,6 +301,10 @@ export default function App() {
     if (cache) { setMpData(cache.data || {}); setLastSynced(cache.ts || null); }
   }, []);
 
+  useEffect(() => {
+    try { localStorage.setItem(CLIENTS_KEY, JSON.stringify(clients)); } catch {}
+  }, [clients]);
+
   const client   = selected !== null ? clients.find(c => c.id === selected) : null;
   const enriched = clients.map(c => ({ ...c, ...(mpData[c.id] || {}) }));
   const filtered = filter === "All" ? enriched : enriched.filter(c => getHealth(c.daysAgo) === filter);
@@ -298,18 +312,19 @@ export default function App() {
   const canSync      = !loading && (!lastSynced || Date.now() - lastSynced > COOLDOWN_MS);
   const cooldownMins = lastSynced ? Math.max(0, Math.ceil((COOLDOWN_MS - (Date.now() - lastSynced)) / 60000)) : 0;
 
-  const loadMixpanelData = useCallback(async () => {
-    if (!canSync) return;
+  const loadMixpanelData = useCallback(async (clientSubset) => {
+    const targetClients = clientSubset || clients;
+    if (!clientSubset && !canSync) return;
     setLoading(true);
-    setSyncErrors({});
-    const result = {};
-    const errors = {};
+    if (!clientSubset) setSyncErrors({});
+    const result = { ...mpData };
+    const errors = { ...syncErrors };
 
-    for (const c of clients) {
+    for (const c of targetClients) {
+      delete errors[c.id];
       setLoadingMsg("Syncing " + c.name + "…");
       try {
         result[c.id] = await fetchDomainData(c.domains);
-        // Progressive update so first client shows while second loads
         setMpData(prev => ({ ...prev, [c.id]: result[c.id] }));
       } catch (e) {
         console.error("Sync failed for", c.name, e.message);
@@ -323,12 +338,12 @@ export default function App() {
 
     const ts = Date.now();
     setMpData(result);
-    setLastSynced(ts);
+    if (!clientSubset) setLastSynced(ts);
     setSyncErrors(errors);
     saveCache({ data: result, ts });
     setLoading(false);
     setLoadingMsg("");
-  }, [clients, canSync]);
+  }, [clients, canSync, mpData, syncErrors]);
 
   const openAdd  = id => { setForm({ text: "", due: "", priority: "Medium", status: "To Do", notes: "" }); setTodoModal({ clientId: id, todo: null }); };
   const openEdit = (id, todo) => { setForm({ ...todo }); setTodoModal({ clientId: id, todo }); };
@@ -378,7 +393,7 @@ export default function App() {
           </div>
           <div className="flex flex-col items-end gap-1 ml-2">
             <div className="flex gap-2">
-              <button onClick={loadMixpanelData} disabled={!canSync}
+              <button onClick={() => loadMixpanelData()} disabled={!canSync}
                 className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-medium transition-all hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed"
                 style={{ backgroundColor: BRAND, color: "#000" }}>
                 {loading ? <><Spinner /> {loadingMsg || "Syncing..."}</> : "↻ Sync Mixpanel"}
@@ -407,9 +422,18 @@ export default function App() {
 
       {Object.keys(syncErrors).length > 0 && !loading && (
         <div className="px-6 py-2 text-xs bg-red-900/20 border-b border-red-800/30">
-          {clients.filter(c => syncErrors[c.id]).map(c => (
-            <div key={c.id} className="text-red-400">✗ {c.name}: {syncErrors[c.id]}</div>
-          ))}
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              {clients.filter(c => syncErrors[c.id]).map(c => (
+                <div key={c.id} className="text-red-400">✗ {c.name}: {syncErrors[c.id]}</div>
+              ))}
+            </div>
+            <button
+              onClick={() => loadMixpanelData(clients.filter(c => syncErrors[c.id]))}
+              className="flex-shrink-0 px-2 py-1 rounded text-red-300 border border-red-700 hover:bg-red-900/40 transition-colors">
+              ↻ Retry failed
+            </button>
+          </div>
         </div>
       )}
 
