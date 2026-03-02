@@ -161,8 +161,8 @@ async function fetchDomainData(domains) {
 
   // ── Step 2: Export → events ───────────────────────────────────────────────
   // Date range: 90 days back. Max allowed by Mixpanel Export is 365 days.
-  const to90   = new Date().toISOString().slice(0, 10);
-  const from90 = new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10);
+  const to90   = new Date(Date.now() - 86400000).toISOString().slice(0, 10);   // yesterday — Mixpanel Export rejects today's date
+  const from90 = new Date(Date.now() - 91 * 86400000).toISOString().slice(0, 10);
 
   console.log("[fetchDomainData] Export", from90, "→", to90, "for", distinctIds.length, "users");
 
