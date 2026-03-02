@@ -11,7 +11,7 @@ const STATUS_COLORS = {
 };
 const BG0 = "#0a0a0a", BG1 = "#111111", BG2 = "#1a1a1a", BG3 = "#2a2a2a", BRD = "#222222";
 const COOLDOWN_MS  = 30 * 60 * 1000;
-const CACHE_KEY    = "mp_cache_v1";
+const CACHE_KEY    = "mp_cache_v2";
 const CLIENTS_KEY  = "cs_clients_v1";
 
 // Must exactly match Mixpanel Lexicon event names (case-sensitive, whitespace-sensitive)
@@ -56,6 +56,15 @@ function daysSince(dateStr) {
 function fmt(dateStr) {
   if (!dateStr) return "—";
   return new Date(dateStr).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+}
+function fmtDateTime(ts) {
+  if (!ts) return "—";
+  const d = new Date(ts);
+  const date = d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+  const time = d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+  const days = Math.floor((Date.now() - ts) / 86400000);
+  const ago  = days === 0 ? "today" : days === 1 ? "1d ago" : days + "d ago";
+  return { date, time, ago };
 }
 function timeAgo(ts) {
   if (!ts) return null;
@@ -137,6 +146,7 @@ async function fetchDomainData(domains) {
     return {
       lastEvent: "No users found", lastUser: "—", lastDate: null,
       daysAgo: null, eventCount: 0, topEvent: "—", newUsers: 0,
+      pinCount: 0, projectCount: 0, reportCount: 0, signInCount: 0, recentEvents: [],
     };
   }
 
@@ -186,6 +196,15 @@ async function fetchDomainData(domains) {
 
   console.log("[fetchDomainData] valid sorted events:", events.length);
 
+  // Build a lookup map from distinct_id → profile email for fast resolution
+  const profileMap = {};
+  profiles.forEach(p => {
+    if (p.$distinct_id) {
+      const props = p.$properties || {};
+      profileMap[p.$distinct_id] = props.$email || props.email || p.$distinct_id;
+    }
+  });
+
   // ── Last event ─────────────────────────────────────────────────────────────
   let lastEvent = "No recent activity";
   let lastUser  = "—";
@@ -193,17 +212,14 @@ async function fetchDomainData(domains) {
   let daysAgo   = null;
 
   if (events.length) {
-    const e       = events[0];
-    const ts      = e.properties.time;
-    lastDate      = new Date(ts * 1000).toISOString().slice(0, 10);
-    daysAgo       = daysSince(lastDate);
-    lastEvent     = e.event || "Unknown event";
-
-    // Match back to profile for email — Export only has distinct_id
-    const profile = profiles.find(p => p.$distinct_id === e.distinct_id);
-    const props   = profile?.$properties || {};
-    // RISK: email stored under different key names depending on Mixpanel setup
-    lastUser = props.$email || props.email || e.distinct_id || "—";
+    const e   = events[0];
+    const ts  = e.properties.time;
+    lastDate  = new Date(ts * 1000).toISOString().slice(0, 10);
+    daysAgo   = daysSince(lastDate);
+    lastEvent = e.event || "Unknown event";
+    // distinct_id lives in e.properties in Mixpanel export format, not e.distinct_id
+    const did = e.properties?.distinct_id;
+    lastUser  = profileMap[did] || did || "—";
   }
 
   // ── 30-day metrics ─────────────────────────────────────────────────────────
@@ -217,7 +233,23 @@ async function fetchDomainData(domains) {
   });
   const topEvent = Object.entries(eventMap).sort((a, b) => b[1] - a[1])[0]?.[0] || "—";
 
-  return { lastEvent, lastUser, lastDate, daysAgo, eventCount, topEvent, newUsers };
+  // ── Event-type counts (30d) ────────────────────────────────────────────────
+  const PIN_EVENTS    = ["Pin Created", "Pin Saved", "Pin Updated"];
+  const REPORT_EVENTS = ["Report Created", "Report Draft Published"];
+  const pinCount     = recent.filter(e => PIN_EVENTS.includes(e.event)).length;
+  const projectCount = recent.filter(e => e.event === "Project Created").length;
+  const reportCount  = recent.filter(e => REPORT_EVENTS.includes(e.event)).length;
+  const signInCount  = recent.filter(e => e.event === "User Signed In").length;
+
+  // ── Last 10 events (all time within 90d window) ────────────────────────────
+  const recentEvents = events.slice(0, 10).map(e => ({
+    event: e.event || "Unknown",
+    email: profileMap[e.properties?.distinct_id] || e.properties?.distinct_id || "—",
+    ts:    e.properties.time * 1000,
+  }));
+
+  return { lastEvent, lastUser, lastDate, daysAgo, eventCount, topEvent, newUsers,
+           pinCount, projectCount, reportCount, signInCount, recentEvents };
 }
 
 // ── Components ────────────────────────────────────────────────────────────────
@@ -293,6 +325,7 @@ export default function App() {
   const [activeTab, setActiveTab]           = useState("overview");
   const [todoModal, setTodoModal]           = useState(null);
   const [settingsOpen, setSettingsOpen]     = useState(false);
+  const [expandedCard, setExpandedCard]     = useState(null);
   const [editingClients, setEditingClients] = useState(DEFAULT_CLIENTS);
   const [form, setForm] = useState({ text: "", due: "", priority: "Medium", status: "To Do", notes: "" });
 
@@ -332,6 +365,7 @@ export default function App() {
         result[c.id] = {
           lastEvent: "Sync error", lastUser: "—", lastDate: null,
           daysAgo: null, eventCount: 0, topEvent: "—", newUsers: 0,
+          pinCount: 0, projectCount: 0, reportCount: 0, signInCount: 0, recentEvents: [],
         };
       }
     }
@@ -486,16 +520,51 @@ export default function App() {
                       <div className="text-[11px] text-gray-400 mt-0.5 truncate">{c.lastUser || (lastSynced ? "—" : "Hit Sync to load data")}</div>
                     </div>
 
-                    <div className="grid grid-cols-3 gap-2 mb-3">
-                      {[["30d Events", c.eventCount ?? "—"], ["Top Feature", null], ["New Users", c.newUsers ?? "—"]].map(([l, v], i) => (
+                    <div className="grid grid-cols-4 gap-1.5 mb-3">
+                      {[
+                        ["Pins",     c.pinCount     ?? "—"],
+                        ["Projects", c.projectCount ?? "—"],
+                        ["Reports",  c.reportCount  ?? "—"],
+                        ["Sign Ins", c.signInCount  ?? "—"],
+                      ].map(([l, v]) => (
                         <div key={l} className="rounded-lg p-2 text-center" style={{ backgroundColor: BG2 }}>
-                          {i === 1
-                            ? <div className="text-[10px] text-gray-200 font-medium leading-tight min-h-[20px]">{c.topEvent || "—"}</div>
-                            : <div className="text-sm font-bold" style={{ color: BRAND }}>{v}</div>}
-                          <div className="text-[10px] text-gray-500 mt-0.5">{l}</div>
+                          <div className="text-sm font-bold" style={{ color: BRAND }}>{v}</div>
+                          <div className="text-[10px] text-gray-500 mt-0.5 leading-tight">{l}</div>
                         </div>
                       ))}
                     </div>
+
+                    {(c.recentEvents?.length > 0) && (
+                      <div className="mb-3">
+                        <button
+                          onClick={e => { e.stopPropagation(); setExpandedCard(expandedCard === c.id ? null : c.id); }}
+                          className="w-full flex items-center justify-between px-3 py-1.5 rounded-lg text-[11px] text-gray-400 hover:text-gray-200 transition-colors"
+                          style={{ backgroundColor: BG2 }}>
+                          <span>Recent activity</span>
+                          <span>{expandedCard === c.id ? "▲" : "▼"} {c.recentEvents.length} events</span>
+                        </button>
+                        {expandedCard === c.id && (
+                          <div className="mt-1 rounded-lg overflow-hidden" style={{ border: "1px solid " + BG3 }}>
+                            {c.recentEvents.map((ev, idx) => {
+                              const dt = fmtDateTime(ev.ts);
+                              return (
+                                <div key={idx} className={"px-3 py-2 flex items-start gap-2" + (idx % 2 === 0 ? "" : "")}
+                                  style={{ backgroundColor: idx % 2 === 0 ? BG2 : BG1, borderTop: idx > 0 ? "1px solid " + BG3 : "none" }}>
+                                  <div className="flex-1 min-w-0">
+                                    <div className="text-[11px] text-gray-200 font-medium truncate">{ev.event}</div>
+                                    <div className="text-[10px] text-gray-500 truncate">{ev.email}</div>
+                                  </div>
+                                  <div className="text-right flex-shrink-0">
+                                    <div className="text-[10px] font-medium" style={{ color: BRAND }}>{dt.ago}</div>
+                                    <div className="text-[10px] text-gray-600">{dt.date} · {dt.time}</div>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
+                    )}
 
                     {nextTodo ? (
                       <div className="rounded-lg p-2 text-xs" style={{ backgroundColor: BG2 }}>
@@ -550,42 +619,74 @@ export default function App() {
             ))}
           </div>
 
-          {activeTab === "overview" && (
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-              <div className="rounded-xl p-5" style={{ backgroundColor: BG1, border: "1px solid " + BRD }}>
-                <div className="text-xs text-gray-500 uppercase tracking-wide font-medium mb-4">Mixpanel Activity</div>
-                <div className="space-y-4">
-                  {[
-                    ["Last Event",        mpData[client.id]?.lastEvent || "—"],
-                    ["By User",           mpData[client.id]?.lastUser  || "—"],
-                    ["Date",              fmt(mpData[client.id]?.lastDate)],
-                    ["Top Feature (90d)", mpData[client.id]?.topEvent  || "—"],
-                  ].map(([l, v]) => (
-                    <div key={l}>
-                      <div className="text-gray-500 text-xs mb-0.5">{l}</div>
-                      <div className="text-white font-medium text-sm break-all">{v}</div>
+          {activeTab === "overview" && (() => {
+            const d = mpData[client.id] || {};
+            return (
+              <div className="space-y-4">
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                  <div className="rounded-xl p-5" style={{ backgroundColor: BG1, border: "1px solid " + BRD }}>
+                    <div className="text-xs text-gray-500 uppercase tracking-wide font-medium mb-4">Last Activity</div>
+                    <div className="space-y-4">
+                      {[
+                        ["Last Event", d.lastEvent || "—"],
+                        ["By User",    d.lastUser  || "—"],
+                        ["Date",       fmt(d.lastDate)],
+                        ["Top Feature (90d)", d.topEvent || "—"],
+                      ].map(([l, v]) => (
+                        <div key={l}>
+                          <div className="text-gray-500 text-xs mb-0.5">{l}</div>
+                          <div className="text-white font-medium text-sm break-all">{v}</div>
+                        </div>
+                      ))}
                     </div>
-                  ))}
-                </div>
-              </div>
-              <div className="rounded-xl p-5" style={{ backgroundColor: BG1, border: "1px solid " + BRD }}>
-                <div className="text-xs text-gray-500 uppercase tracking-wide font-medium mb-4">Account Metrics</div>
-                <div className="grid grid-cols-2 gap-3">
-                  {[
-                    ["Events (30d)",      mpData[client.id]?.eventCount ?? "—"],
-                    ["New Users (MTD)",   mpData[client.id]?.newUsers   ?? "—"],
-                    ["Days Since Active", mpData[client.id]?.daysAgo    ?? "—"],
-                    ["Health",            getHealth(mpData[client.id]?.daysAgo)],
-                  ].map(([l, v]) => (
-                    <div key={l} className="rounded-lg p-3" style={{ backgroundColor: BG2 }}>
-                      <div className="text-2xl font-bold" style={{ color: BRAND }}>{v}</div>
-                      <div className="text-xs text-gray-500 mt-0.5">{l}</div>
+                  </div>
+                  <div className="rounded-xl p-5" style={{ backgroundColor: BG1, border: "1px solid " + BRD }}>
+                    <div className="text-xs text-gray-500 uppercase tracking-wide font-medium mb-4">30-Day Metrics</div>
+                    <div className="grid grid-cols-2 gap-3">
+                      {[
+                        ["Pin Drops",    d.pinCount     ?? "—"],
+                        ["Projects",     d.projectCount ?? "—"],
+                        ["Reports",      d.reportCount  ?? "—"],
+                        ["Sign Ins",     d.signInCount  ?? "—"],
+                        ["New Users (MTD)",   d.newUsers   ?? "—"],
+                        ["Days Since Active", d.daysAgo    ?? "—"],
+                      ].map(([l, v]) => (
+                        <div key={l} className="rounded-lg p-3" style={{ backgroundColor: BG2 }}>
+                          <div className="text-2xl font-bold" style={{ color: BRAND }}>{v}</div>
+                          <div className="text-xs text-gray-500 mt-0.5">{l}</div>
+                        </div>
+                      ))}
                     </div>
-                  ))}
+                  </div>
                 </div>
+
+                {(d.recentEvents?.length > 0) && (
+                  <div className="rounded-xl p-5" style={{ backgroundColor: BG1, border: "1px solid " + BRD }}>
+                    <div className="text-xs text-gray-500 uppercase tracking-wide font-medium mb-4">Recent Events (last {d.recentEvents.length})</div>
+                    <div className="rounded-lg overflow-hidden" style={{ border: "1px solid " + BG3 }}>
+                      {d.recentEvents.map((ev, idx) => {
+                        const dt = fmtDateTime(ev.ts);
+                        return (
+                          <div key={idx} className="px-4 py-3 flex items-center gap-4"
+                            style={{ backgroundColor: idx % 2 === 0 ? BG2 : BG1, borderTop: idx > 0 ? "1px solid " + BG3 : "none" }}>
+                            <div className="flex-1 min-w-0">
+                              <div className="text-sm text-gray-200 font-medium">{ev.event}</div>
+                              <div className="text-xs text-gray-500 truncate mt-0.5">{ev.email}</div>
+                            </div>
+                            <div className="text-right flex-shrink-0">
+                              <div className="text-xs font-semibold" style={{ color: BRAND }}>{dt.ago}</div>
+                              <div className="text-[11px] text-gray-500 mt-0.5">{dt.date}</div>
+                              <div className="text-[11px] text-gray-600">{dt.time}</div>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
               </div>
-            </div>
-          )}
+            );
+          })()}
 
           {activeTab === "todos" && (
             <div>
