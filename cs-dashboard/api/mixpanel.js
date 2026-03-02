@@ -68,6 +68,7 @@ export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
   // ── Parse body safely ─────────────────────────────────────────────────────
+  // RISK: req.body can be undefined if Content-Type header is wrong or body is malformed
   let endpoint, params;
   try {
     ({ endpoint, params } = req.body || {});
@@ -83,6 +84,7 @@ export default async function handler(req, res) {
 
     // ── ENGAGE ──────────────────────────────────────────────────────────────
     if (endpoint === "engage") {
+      // RISK: domain param could be undefined, null, or empty array
       const rawDomains = params.domain;
       if (!rawDomains || (Array.isArray(rawDomains) && rawDomains.length === 0)) {
         return res.status(400).json({ error: "Engage requires at least one domain" });
@@ -91,6 +93,7 @@ export default async function handler(req, res) {
       const cleaned = domains.map(d => String(d).trim().toLowerCase()).filter(Boolean);
       if (!cleaned.length) return res.status(400).json({ error: "Engage: all domains were empty after cleaning" });
 
+      // Engage selector: "in" operator for substring match — only valid syntax for this API
       const where = cleaned.map(d => `"@${d}" in properties["$email"]`).join(" or ");
 
       let allResults = [];
@@ -101,7 +104,7 @@ export default async function handler(req, res) {
         const bodyObj = { where, project_id: projectId, page_size: 1000 };
         if (sessionId !== null) {
           bodyObj.session_id = sessionId;
-          bodyObj.page       = page;
+          bodyObj.page       = page; // must be integer
         }
 
         let r, text;
@@ -118,13 +121,15 @@ export default async function handler(req, res) {
 
         console.log("Engage page", page, "status:", r.status, "body:", text.slice(0, 400));
 
+        // RISK: Mixpanel returns 200 with an error body in some cases (e.g. bad session_id)
         if (!r.ok) return res.status(r.status).json({ error: "Engage failed", body: text.slice(0, 500) });
 
         let data;
         try { data = JSON.parse(text); } catch {
-          return res.status(500).json({ error: "Engage invalid JSON", raw: text.slice(0, 300) });
+          return res.status(500).json({ error: "Engage returned invalid JSON", raw: text.slice(0, 300) });
         }
 
+        // RISK: results key missing entirely on some error responses
         if (!data || !Array.isArray(data.results)) {
           console.warn("Engage unexpected response shape:", JSON.stringify(data).slice(0, 200));
           break;
@@ -134,11 +139,14 @@ export default async function handler(req, res) {
         allResults = allResults.concat(data.results);
         console.log("Engage accumulated:", allResults.length, "of", data.total);
 
+        // RISK: session_id missing on single-page responses — only paginate if we have it
         if (data.session_id) sessionId = data.session_id;
 
+        // RISK: data.total could be 0 or undefined — guard against infinite loop
         const total = Number(data.total) || 0;
         if (!total || allResults.length >= total) break;
 
+        // RISK: if session_id never arrived we can't paginate — bail to avoid infinite loop
         if (!sessionId) {
           console.warn("Engage: no session_id returned, stopping pagination at", allResults.length);
           break;
@@ -155,17 +163,23 @@ export default async function handler(req, res) {
     if (endpoint === "export") {
       const { from_date, to_date, event, distinct_ids } = params;
 
+      // RISK: missing required date params
       if (!from_date || !to_date) {
         return res.status(400).json({ error: "Export requires from_date and to_date" });
       }
 
+      // RISK: date range too large — Export API max is 365 days
       const dayRange = Math.floor((new Date(to_date) - new Date(from_date)) / 86400000);
-      if (dayRange > 365) return res.status(400).json({ error: "Export date range exceeds 365 days" });
-      if (dayRange < 0)   return res.status(400).json({ error: "Export from_date is after to_date" });
+      if (dayRange > 365) {
+        return res.status(400).json({ error: "Export date range exceeds 365 days (" + dayRange + " days requested)" });
+      }
+      if (dayRange < 0) {
+        return res.status(400).json({ error: "Export from_date is after to_date" });
+      }
 
       console.log("Export params — from:", from_date, "to:", to_date, "events:", Array.isArray(event) ? event.length : event, "distinct_ids:", distinct_ids?.length);
 
-      // Normalize event param
+      // Normalize event param — accept raw array or pre-stringified
       let eventStr;
       if (Array.isArray(event)) {
         if (event.length === 0) return res.status(400).json({ error: "Export: event array is empty" });
@@ -178,7 +192,7 @@ export default async function handler(req, res) {
       }
       if (!eventStr) console.warn("Export: no event filter — may return very large response");
 
-      // Helper: run one Export POST request
+      // Helper: run one Export request for a given where clause
       async function runExport(where) {
         const exportParams = { from_date, to_date, project_id: projectId };
         if (eventStr) exportParams.event = eventStr;
@@ -196,14 +210,34 @@ export default async function handler(req, res) {
         return text;
       }
 
-      // Chunk distinct_ids into batches of 50
-      const BATCH  = 50;
-      const ids    = (distinct_ids || []).slice(0, 500).map(id => String(id).replace(/"/g, '\\"'));
+      // Chunk distinct_ids into batches of 50 to stay within Mixpanel's
+      // expression complexity limit (~50 OR clauses is safe)
+      const BATCH = 50;
+      const ids   = (distinct_ids || []).slice(0, 500).map(id => String(id).replace(/"/g, '\\"'));
       const chunks = [];
       for (let i = 0; i < ids.length; i += BATCH) chunks.push(ids.slice(i, i + BATCH));
-      if ((distinct_ids || []).length > 500) console.warn("distinct_ids capped at 500");
+      if (ids.length > 500) console.warn("distinct_ids capped at 500 from", distinct_ids.length);
 
-      console.log("Export: running", chunks.length || 1, "batch(es) of up to", BATCH, "IDs");
+      console.log("Export: running", chunks.length, "batch(es) of up to", BATCH, "IDs");
+
+      // First: try a no-where probe request to confirm base Export works at all
+      // This eliminates auth/date/event issues from where-clause issues
+      try {
+        const probeParams = { from_date, to_date, project_id: projectId };
+        if (eventStr) probeParams.event = eventStr;
+        const probeR = await mpFetch("https://data.mixpanel.com/api/2.0/export", {
+          method:  "POST",
+          headers: { ...headers, "Content-Type": "application/x-www-form-urlencoded", Accept: "text/plain" },
+          body:    new URLSearchParams(probeParams).toString(),
+        });
+        const probeText = await probeR.text();
+        console.log("Export probe (no where) status:", probeR.status, "| preview:", probeText.slice(0, 200));
+        if (!probeR.ok) {
+          return res.status(probeR.status).json({ error: "Export failed even without where clause", body: probeText.slice(0, 500) });
+        }
+      } catch (e) {
+        return res.status(500).json({ error: "Export probe failed: " + e.message });
+      }
 
       let allLines = [];
       if (chunks.length === 0) {
@@ -215,13 +249,22 @@ export default async function handler(req, res) {
         }
       } else {
         for (const chunk of chunks) {
-          const where = "(" + chunk.map(id => `distinct_id == "${id}"`).join(" or ") + ")";
-          try {
-            const text = await runExport(where);
-            if (text?.trim()) allLines.push(...text.trim().split("\n").filter(Boolean));
-          } catch (e) {
-            console.error("Export chunk failed:", e.message);
+          // Try both syntaxes — some Mixpanel projects use different JQL dialects
+          const whereV1 = "(" + chunk.map(id => `distinct_id == "${id}"`).join(" or ") + ")";
+          const whereV2 = "(" + chunk.map(id => `properties["distinct_id"] == "${id}"`).join(" or ") + ")";
+          let chunkDone = false;
+          for (const where of [whereV1, whereV2]) {
+            try {
+              const text = await runExport(where);
+              if (text?.trim()) allLines.push(...text.trim().split("\n").filter(Boolean));
+              console.log("Export chunk succeeded with where syntax:", where.slice(0, 60));
+              chunkDone = true;
+              break;
+            } catch (e) {
+              console.warn("Export chunk syntax failed:", where.slice(0, 60), "—", e.message);
+            }
           }
+          if (!chunkDone) console.error("Export chunk failed with all syntaxes for", chunk.length, "IDs");
         }
       }
 
@@ -233,7 +276,7 @@ export default async function handler(req, res) {
       if (bad > 0) console.warn("Export skipped", bad, "unparseable lines");
 
       parsed.sort((a, b) => (b.properties?.time ?? 0) - (a.properties?.time ?? 0));
-      console.log("Export total parsed:", parsed.length, "events from", allLines.length, "lines");
+      console.log("Export total parsed:", parsed.length, "events from", allLines.length, "lines across", chunks.length || 1, "batch(es)");
       return res.status(200).json({ results: parsed });
     }
 
