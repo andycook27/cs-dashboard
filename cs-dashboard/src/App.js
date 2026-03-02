@@ -10,10 +10,11 @@ const STATUS_COLORS = {
   "Blocked":     "bg-red-800 text-red-100",
 };
 const BG0 = "#0a0a0a", BG1 = "#111111", BG2 = "#1a1a1a", BG3 = "#2a2a2a", BRD = "#222222";
-const COOLDOWN_MS = 30 * 60 * 1000;
-const CACHE_KEY   = "mp_cache_v1";
+const COOLDOWN_MS  = 30 * 60 * 1000;
+const CACHE_KEY    = "mp_cache_v1";
+const CLIENTS_KEY  = "cs_clients_v1";
 
-// These must exactly match event names in Mixpanel Lexicon (case-sensitive, whitespace-sensitive)
+// Must exactly match Mixpanel Lexicon event names (case-sensitive, whitespace-sensitive)
 const KEY_EVENTS = [
   "User Signed In",
   "Project Created",
@@ -71,14 +72,17 @@ let memCache = null;
 function loadCache() {
   if (memCache) return memCache;
   try {
-    const r = sessionStorage.getItem(CACHE_KEY);
+    const r = localStorage.getItem(CACHE_KEY);
     if (r) { memCache = JSON.parse(r); return memCache; }
   } catch {}
   return null;
 }
 function saveCache(data) {
   memCache = data;
-  try { sessionStorage.setItem(CACHE_KEY, JSON.stringify(data)); } catch {}
+  try {
+    if (data) localStorage.setItem(CACHE_KEY, JSON.stringify(data));
+    else localStorage.removeItem(CACHE_KEY);
+  } catch {}
 }
 
 // ── API proxy call ────────────────────────────────────────────────────────────
@@ -93,6 +97,7 @@ async function mpCall(endpoint, params) {
       body:    JSON.stringify({ endpoint, params }),
     });
   } catch (e) {
+    // RISK: network failure (offline, Vercel cold start timeout, DNS failure)
     throw new Error("Network error calling /api/mixpanel: " + e.message);
   }
 
@@ -100,6 +105,7 @@ async function mpCall(endpoint, params) {
   try {
     data = await res.json();
   } catch (e) {
+    // RISK: proxy returned non-JSON (e.g. Vercel 504 HTML page)
     throw new Error("Non-JSON response from proxy (status " + res.status + ") — check Vercel logs");
   }
 
@@ -111,39 +117,57 @@ async function mpCall(endpoint, params) {
 
 // ── Core data fetch ───────────────────────────────────────────────────────────
 async function fetchDomainData(domains) {
-  if (!domains || domains.length === 0) throw new Error("No domains configured for this client");
+
+  // RISK: domains array empty or undefined — would send bad Engage request
+  if (!domains || domains.length === 0) {
+    throw new Error("No domains configured for this client");
+  }
   const cleanDomains = domains.map(d => String(d).trim().toLowerCase()).filter(Boolean);
   if (!cleanDomains.length) throw new Error("All domains were empty after cleaning");
 
-  // Step 1: Engage → profiles
+  // ── Step 1: Engage → profiles ─────────────────────────────────────────────
   console.log("[fetchDomainData] Engage for domains:", cleanDomains);
   const engageData = await mpCall("engage", { domain: cleanDomains });
-  const profiles   = Array.isArray(engageData.results) ? engageData.results : [];
+
+  // RISK: results key missing or not an array
+  const profiles = Array.isArray(engageData.results) ? engageData.results : [];
   console.log("[fetchDomainData] Engage profiles:", profiles.length);
 
   if (!profiles.length) {
-    return { lastEvent: "No users found", lastUser: "—", lastDate: null, daysAgo: null, eventCount: 0, topEvent: "—", newUsers: 0 };
+    return {
+      lastEvent: "No users found", lastUser: "—", lastDate: null,
+      daysAgo: null, eventCount: 0, topEvent: "—", newUsers: 0,
+    };
   }
 
+  // RISK: $distinct_id missing on some profiles — filter defensively
   const distinctIds = profiles.map(p => p?.$distinct_id).filter(id => id && typeof id === "string");
   console.log("[fetchDomainData] valid distinct_ids:", distinctIds.length, "of", profiles.length);
-  if (!distinctIds.length) throw new Error("Engage returned profiles but none had valid $distinct_id");
 
+  if (!distinctIds.length) {
+    throw new Error("Engage returned profiles but none had valid $distinct_id");
+  }
+
+  // New users this month — check all known created-date property names
   const mtdStart = new Date(new Date().getFullYear(), new Date().getMonth(), 1).getTime();
   const newUsers  = profiles.filter(p => {
     const props   = p?.$properties || {};
     const created = props.$created || props.created || props.created_at;
     if (!created) return false;
     const t = new Date(created).getTime();
+    // RISK: invalid date strings would return NaN — guard with isNaN
     return !isNaN(t) && t >= mtdStart;
   }).length;
 
-  // Step 2: Export → events
-  // Mixpanel Export requires to_date to be strictly before today
-  const to90   = new Date(Date.now() - 86400000).toISOString().slice(0, 10); // yesterday
+  // ── Step 2: Export → events ───────────────────────────────────────────────
+  // Date range: 90 days back. Max allowed by Mixpanel Export is 365 days.
+  const to90   = new Date().toISOString().slice(0, 10);
   const from90 = new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10);
+
   console.log("[fetchDomainData] Export", from90, "→", to90, "for", distinctIds.length, "users");
 
+  // RISK: passing KEY_EVENTS as raw array — proxy must handle JSON.stringify (it does)
+  // Do NOT call JSON.stringify here — that would double-encode it
   const exportData = await mpCall("export", {
     from_date:    from90,
     to_date:      to90,
@@ -151,30 +175,46 @@ async function fetchDomainData(domains) {
     distinct_ids: distinctIds,
   });
 
+  // RISK: results missing or not array
   const rawEvents = Array.isArray(exportData.results) ? exportData.results : [];
   console.log("[fetchDomainData] Export raw events:", rawEvents.length);
 
+  // RISK: events missing properties entirely — filter before sorting
   const events = rawEvents
     .filter(e => e && e.properties && typeof e.properties.time === "number")
     .sort((a, b) => b.properties.time - a.properties.time);
+
   console.log("[fetchDomainData] valid sorted events:", events.length);
 
-  let lastEvent = "No recent activity", lastUser = "—", lastDate = null, daysAgo = null;
+  // ── Last event ─────────────────────────────────────────────────────────────
+  let lastEvent = "No recent activity";
+  let lastUser  = "—";
+  let lastDate  = null;
+  let daysAgo   = null;
+
   if (events.length) {
     const e       = events[0];
-    lastDate      = new Date(e.properties.time * 1000).toISOString().slice(0, 10);
+    const ts      = e.properties.time;
+    lastDate      = new Date(ts * 1000).toISOString().slice(0, 10);
     daysAgo       = daysSince(lastDate);
     lastEvent     = e.event || "Unknown event";
+
+    // Match back to profile for email — Export only has distinct_id
     const profile = profiles.find(p => p.$distinct_id === e.distinct_id);
     const props   = profile?.$properties || {};
-    lastUser      = props.$email || props.email || e.distinct_id || "—";
+    // RISK: email stored under different key names depending on Mixpanel setup
+    lastUser = props.$email || props.email || e.distinct_id || "—";
   }
 
+  // ── 30-day metrics ─────────────────────────────────────────────────────────
   const from30ts   = Date.now() - 30 * 86400000;
   const recent     = events.filter(e => e.properties.time * 1000 >= from30ts);
   const eventCount = recent.length;
-  const eventMap   = {};
-  recent.forEach(e => { if (e.event) eventMap[e.event] = (eventMap[e.event] || 0) + 1; });
+
+  const eventMap = {};
+  recent.forEach(e => {
+    if (e.event) eventMap[e.event] = (eventMap[e.event] || 0) + 1;
+  });
   const topEvent = Object.entries(eventMap).sort((a, b) => b[1] - a[1])[0]?.[0] || "—";
 
   return { lastEvent, lastUser, lastDate, daysAgo, eventCount, topEvent, newUsers };
@@ -236,7 +276,13 @@ const inputStyle = { backgroundColor: BG2, border: "1px solid " + BG3, color: "w
 
 // ── App ───────────────────────────────────────────────────────────────────────
 export default function App() {
-  const [clients, setClients]               = useState(DEFAULT_CLIENTS);
+  const [clients, setClients]               = useState(() => {
+    try {
+      const saved = localStorage.getItem(CLIENTS_KEY);
+      if (saved) return JSON.parse(saved);
+    } catch {}
+    return DEFAULT_CLIENTS;
+  });
   const [mpData, setMpData]                 = useState({});
   const [loading, setLoading]               = useState(false);
   const [loadingMsg, setLoadingMsg]         = useState("");
@@ -255,6 +301,10 @@ export default function App() {
     if (cache) { setMpData(cache.data || {}); setLastSynced(cache.ts || null); }
   }, []);
 
+  useEffect(() => {
+    try { localStorage.setItem(CLIENTS_KEY, JSON.stringify(clients)); } catch {}
+  }, [clients]);
+
   const client   = selected !== null ? clients.find(c => c.id === selected) : null;
   const enriched = clients.map(c => ({ ...c, ...(mpData[c.id] || {}) }));
   const filtered = filter === "All" ? enriched : enriched.filter(c => getHealth(c.daysAgo) === filter);
@@ -262,14 +312,16 @@ export default function App() {
   const canSync      = !loading && (!lastSynced || Date.now() - lastSynced > COOLDOWN_MS);
   const cooldownMins = lastSynced ? Math.max(0, Math.ceil((COOLDOWN_MS - (Date.now() - lastSynced)) / 60000)) : 0;
 
-  const loadMixpanelData = useCallback(async () => {
-    if (!canSync) return;
+  const loadMixpanelData = useCallback(async (clientSubset) => {
+    const targetClients = clientSubset || clients;
+    if (!clientSubset && !canSync) return;
     setLoading(true);
-    setSyncErrors({});
-    const result = {};
-    const errors = {};
+    if (!clientSubset) setSyncErrors({});
+    const result = { ...mpData };
+    const errors = { ...syncErrors };
 
-    for (const c of clients) {
+    for (const c of targetClients) {
+      delete errors[c.id];
       setLoadingMsg("Syncing " + c.name + "…");
       try {
         result[c.id] = await fetchDomainData(c.domains);
@@ -277,18 +329,21 @@ export default function App() {
       } catch (e) {
         console.error("Sync failed for", c.name, e.message);
         errors[c.id] = e.message;
-        result[c.id] = { lastEvent: "Sync error", lastUser: "—", lastDate: null, daysAgo: null, eventCount: 0, topEvent: "—", newUsers: 0 };
+        result[c.id] = {
+          lastEvent: "Sync error", lastUser: "—", lastDate: null,
+          daysAgo: null, eventCount: 0, topEvent: "—", newUsers: 0,
+        };
       }
     }
 
     const ts = Date.now();
     setMpData(result);
-    setLastSynced(ts);
+    if (!clientSubset) setLastSynced(ts);
     setSyncErrors(errors);
     saveCache({ data: result, ts });
     setLoading(false);
     setLoadingMsg("");
-  }, [clients, canSync]);
+  }, [clients, canSync, mpData, syncErrors]);
 
   const openAdd  = id => { setForm({ text: "", due: "", priority: "Medium", status: "To Do", notes: "" }); setTodoModal({ clientId: id, todo: null }); };
   const openEdit = (id, todo) => { setForm({ ...todo }); setTodoModal({ clientId: id, todo }); };
@@ -338,7 +393,7 @@ export default function App() {
           </div>
           <div className="flex flex-col items-end gap-1 ml-2">
             <div className="flex gap-2">
-              <button onClick={loadMixpanelData} disabled={!canSync}
+              <button onClick={() => loadMixpanelData()} disabled={!canSync}
                 className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-medium transition-all hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed"
                 style={{ backgroundColor: BRAND, color: "#000" }}>
                 {loading ? <><Spinner /> {loadingMsg || "Syncing..."}</> : "↻ Sync Mixpanel"}
@@ -367,9 +422,18 @@ export default function App() {
 
       {Object.keys(syncErrors).length > 0 && !loading && (
         <div className="px-6 py-2 text-xs bg-red-900/20 border-b border-red-800/30">
-          {clients.filter(c => syncErrors[c.id]).map(c => (
-            <div key={c.id} className="text-red-400">✗ {c.name}: {syncErrors[c.id]}</div>
-          ))}
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              {clients.filter(c => syncErrors[c.id]).map(c => (
+                <div key={c.id} className="text-red-400">✗ {c.name}: {syncErrors[c.id]}</div>
+              ))}
+            </div>
+            <button
+              onClick={() => loadMixpanelData(clients.filter(c => syncErrors[c.id]))}
+              className="flex-shrink-0 px-2 py-1 rounded text-red-300 border border-red-700 hover:bg-red-900/40 transition-colors">
+              ↻ Retry failed
+            </button>
+          </div>
         </div>
       )}
 
