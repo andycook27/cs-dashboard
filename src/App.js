@@ -10,7 +10,7 @@ const STATUS_COLORS = {
   "Blocked":     "bg-red-800 text-red-100",
 };
 const BG0 = "#0a0a0a", BG1 = "#111111", BG2 = "#1a1a1a", BG3 = "#2a2a2a", BRD = "#222222";
-const CACHE_KEY    = "mp_cache_v2";
+const CACHE_KEY    = "mp_cache_v3";
 const CLIENTS_KEY  = "cs_clients_v2";
 const API_LOG_KEY  = "mp_api_log_v1";
 const EXPORT_LIMIT_HR  = 60;
@@ -28,6 +28,11 @@ const KEY_EVENTS = [
   "Map Layer Created",
   "Pin Updated",
 ];
+
+const PIN_EVENTS     = ["Pin Created", "Pin Saved", "Pin Updated", "Map Layer Created"];
+const REPORT_EVENTS  = ["Report Created", "Report Draft Published", "Share Sent"];
+const PROJECT_EVENTS = ["Project Created", "User Signed In"];
+const CAT_EVENTS     = { All: KEY_EVENTS, Pins: PIN_EVENTS, Reports: REPORT_EVENTS, Projects: PROJECT_EVENTS };
 
 const DEFAULT_CLIENTS = [
   { id:  1, name: "Kimley Horn",                domains: ["kimley-horn.com"],         tier: "Enterprise", todos: [] },
@@ -187,8 +192,8 @@ async function fetchDomainData(domains) {
     return {
       lastEvent: "No users found", lastUser: "—", lastDate: null,
       daysAgo: null, eventCount: 0, topEvent: "—", newUsers: 0,
-      pinCount: 0, projectCount: 0, reportCount: 0, signInCount: 0, recentEvents: [],
-      totalProjects: 0, activeProjects: 0, projectsFromId: false,
+      pinCount: 0, reportCount: 0, projectCount: 0, signInCount: 0,
+      recentEvents: [], eventCounts: {}, userStats: [], dataFrom: null, dataTo: null,
     };
   }
 
@@ -269,49 +274,174 @@ async function fetchDomainData(domains) {
   const recent     = events.filter(e => e.properties.time * 1000 >= from30ts);
   const eventCount = recent.length;
 
-  const eventMap = {};
-  recent.forEach(e => {
-    if (e.event) eventMap[e.event] = (eventMap[e.event] || 0) + 1;
-  });
-  const topEvent = Object.entries(eventMap).sort((a, b) => b[1] - a[1])[0]?.[0] || "—";
+  const eventCounts = {};
+  recent.forEach(e => { if (e.event) eventCounts[e.event] = (eventCounts[e.event] || 0) + 1; });
+  const topEvent     = Object.entries(eventCounts).sort((a, b) => b[1] - a[1])[0]?.[0] || "—";
+  const pinCount     = PIN_EVENTS.reduce((s, n) => s + (eventCounts[n] || 0), 0);
+  const reportCount  = REPORT_EVENTS.reduce((s, n) => s + (eventCounts[n] || 0), 0);
+  const projectCount = PROJECT_EVENTS.reduce((s, n) => s + (eventCounts[n] || 0), 0);
+  const signInCount  = eventCounts["User Signed In"] || 0;
 
-  // ── Event-type counts (30d) ────────────────────────────────────────────────
-  const PIN_EVENTS    = ["Pin Created", "Pin Saved", "Pin Updated"];
-  const REPORT_EVENTS = ["Report Created", "Report Draft Published"];
-  const pinCount     = recent.filter(e => PIN_EVENTS.includes(e.event)).length;
-  const projectCount = recent.filter(e => e.event === "Project Created").length;
-  const reportCount  = recent.filter(e => REPORT_EVENTS.includes(e.event)).length;
-  const signInCount  = recent.filter(e => e.event === "User Signed In").length;
-
-  // ── Last 10 events (all time within 90d window) ────────────────────────────
-  const recentEvents = events.slice(0, 10).map(e => ({
+  // ── Last 50 events (for filtered display) ─────────────────────────────────
+  const recentEvents = events.slice(0, 50).map(e => ({
     event: e.event || "Unknown",
     email: profileMap[e.properties?.distinct_id] || e.properties?.distinct_id || "—",
     ts:    e.properties.time * 1000,
   }));
 
-  // ── Project counts ─────────────────────────────────────────────────────────
-  const PROJECT_ID_KEYS = ["project_id", "projectId", "$project_id", "Project ID", "projectID"];
-  const allProjIds = new Set(), activeProjIds = new Set();
+  // ── Per-user stats ─────────────────────────────────────────────────────────
+  const userMap = {};
   events.forEach(e => {
-    const props = e.properties || {};
-    let pid = null;
-    for (const k of PROJECT_ID_KEYS) { if (props[k]) { pid = String(props[k]); break; } }
-    if (pid) {
-      allProjIds.add(pid);
-      if (e.properties.time * 1000 >= from30ts) activeProjIds.add(pid);
-    }
+    const email = profileMap[e.properties?.distinct_id] || e.properties?.distinct_id || "Unknown";
+    if (!userMap[email]) userMap[email] = { email, allCount: 0, eventCounts: {}, lastTs: e.properties.time * 1000, lastEvent: e.event || "—" };
+    userMap[email].allCount++;
+    if (e.properties.time * 1000 >= from30ts && e.event)
+      userMap[email].eventCounts[e.event] = (userMap[email].eventCounts[e.event] || 0) + 1;
   });
-  const projectsFromId = allProjIds.size > 0;
-  const totalProjects  = allProjIds.size  || events.filter(e => e.event === "Project Created").length;
-  const activeProjects = activeProjIds.size || recent.filter(e => e.event === "Project Created").length;
+  const userStats = Object.values(userMap)
+    .map(u => ({
+      email: u.email, eventCount: u.allCount, eventCounts: u.eventCounts,
+      lastTs: u.lastTs, lastEvent: u.lastEvent,
+      pinCount:     PIN_EVENTS.reduce((s, n) => s + (u.eventCounts[n] || 0), 0),
+      reportCount:  REPORT_EVENTS.reduce((s, n) => s + (u.eventCounts[n] || 0), 0),
+      projectCount: PROJECT_EVENTS.reduce((s, n) => s + (u.eventCounts[n] || 0), 0),
+    }))
+    .sort((a, b) => b.eventCount - a.eventCount)
+    .slice(0, 30);
 
   return { lastEvent, lastUser, lastDate, daysAgo, eventCount, topEvent, newUsers,
-           pinCount, projectCount, reportCount, signInCount, recentEvents,
-           totalProjects, activeProjects, projectsFromId };
+           pinCount, reportCount, projectCount, signInCount,
+           recentEvents, eventCounts, userStats, dataFrom: from90, dataTo: to90 };
 }
 
 // ── Components ────────────────────────────────────────────────────────────────
+function DetailOverview({ d }) {
+  const [dCat,  setDCat]  = useState("All");
+  const [dUser, setDUser] = useState("");
+  const catEvNames = CAT_EVENTS[dCat] || KEY_EVENTS;
+  const counts = dUser
+    ? (d.userStats?.find(u => u.email === dUser)?.eventCounts || {})
+    : (d.eventCounts || {});
+  const maxCount = Math.max(1, ...catEvNames.map(n => counts[n] || 0));
+  const filteredEvs = (d.recentEvents || [])
+    .filter(ev => dCat === "All" || (CAT_EVENTS[dCat] || []).includes(ev.event))
+    .filter(ev => !dUser || ev.email === dUser)
+    .slice(0, 20);
+  return (
+    <div className="space-y-4">
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <div className="rounded-xl p-5" style={{ backgroundColor: BG1, border: "1px solid " + BRD }}>
+          <div className="text-xs text-gray-500 uppercase tracking-wide font-medium mb-1">Last Activity</div>
+          {d.dataFrom && <div className="text-[10px] text-gray-700 mb-3">90d · {fmt(d.dataFrom)} – {fmt(d.dataTo)}</div>}
+          <div className="space-y-3">
+            {[["Last Event", d.lastEvent || "—"], ["By User", d.lastUser || "—"], ["Date", fmt(d.lastDate)], ["Top Feature (90d)", d.topEvent || "—"]].map(([l, v]) => (
+              <div key={l}><div className="text-gray-600 text-xs mb-0.5">{l}</div><div className="text-white font-medium text-sm break-all">{v}</div></div>
+            ))}
+          </div>
+        </div>
+        <div className="rounded-xl p-5" style={{ backgroundColor: BG1, border: "1px solid " + BRD }}>
+          <div className="text-xs text-gray-500 uppercase tracking-wide font-medium mb-4">30-Day Summary</div>
+          <div className="grid grid-cols-3 gap-2">
+            {[["Pins", d.pinCount ?? "—"], ["Reports", d.reportCount ?? "—"], ["Projects", d.projectCount ?? "—"],
+              ["Sign Ins", d.signInCount ?? "—"], ["New Users", d.newUsers ?? "—"], ["Days Since Active", d.daysAgo ?? "—"]].map(([l, v]) => (
+              <div key={l} className="rounded-lg p-3" style={{ backgroundColor: BG2 }}>
+                <div className="text-xl font-bold" style={{ color: BRAND }}>{v}</div>
+                <div className="text-[10px] text-gray-500 mt-0.5 leading-tight">{l}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+      <div className="rounded-xl p-5" style={{ backgroundColor: BG1, border: "1px solid " + BRD }}>
+        <div className="flex items-center gap-2 mb-4 flex-wrap">
+          <div className="text-xs text-gray-500 uppercase tracking-wide font-medium mr-1">Events (30d)</div>
+          {["All", "Pins", "Reports", "Projects"].map(cat => (
+            <button key={cat} onClick={() => setDCat(cat)}
+              className="px-2.5 py-1 rounded-full text-xs font-medium transition-colors"
+              style={dCat === cat ? { backgroundColor: BRAND, color: "#000" } : { backgroundColor: BG2, color: "#9ca3af", border: "1px solid " + BG3 }}>
+              {cat}
+            </button>
+          ))}
+          {d.userStats?.length > 0 && (
+            <select value={dUser} onChange={e => setDUser(e.target.value)}
+              className="ml-auto text-xs rounded-lg px-2 py-1 focus:outline-none cursor-pointer"
+              style={{ backgroundColor: dUser ? BRAND + "20" : BG2, color: dUser ? BRAND : "#9ca3af", border: "1px solid " + (dUser ? BRAND + "40" : BG3) }}>
+              <option value="">All Users ({d.userStats.length})</option>
+              {d.userStats.map(u => <option key={u.email} value={u.email}>{u.email} ({u.eventCount})</option>)}
+            </select>
+          )}
+        </div>
+        <div className="space-y-2">
+          {catEvNames.filter(n => dCat !== "All" || (counts[n] || 0) > 0).map(evName => (
+            <div key={evName} className="flex items-center gap-3">
+              <span className="text-sm text-gray-400 flex-1 min-w-0 truncate">{evName}</span>
+              <div className="w-32 h-2 rounded-full overflow-hidden flex-shrink-0" style={{ backgroundColor: BG3 }}>
+                <div className="h-full rounded-full" style={{ width: ((counts[evName] || 0) / maxCount * 100) + "%", backgroundColor: BRAND }} />
+              </div>
+              <span className="text-sm font-bold w-6 text-right flex-shrink-0" style={{ color: BRAND }}>{counts[evName] || 0}</span>
+            </div>
+          ))}
+          {catEvNames.every(n => (counts[n] || 0) === 0) && <div className="text-sm text-gray-600 text-center py-2">No activity</div>}
+        </div>
+      </div>
+      {d.userStats?.length > 0 && (
+        <div className="rounded-xl p-5" style={{ backgroundColor: BG1, border: "1px solid " + BRD }}>
+          <div className="text-xs text-gray-500 uppercase tracking-wide font-medium mb-4">Users ({d.userStats.length})</div>
+          <div className="rounded-lg overflow-hidden" style={{ border: "1px solid " + BG3 }}>
+            <div className="grid text-[10px] text-gray-600 uppercase px-3 py-1.5"
+              style={{ backgroundColor: BG3, gridTemplateColumns: "1fr 56px 56px 56px 56px 88px" }}>
+              <div>Email</div><div className="text-right">Events</div><div className="text-right">Pins</div>
+              <div className="text-right">Reports</div><div className="text-right">Projects</div><div className="text-right">Last Active</div>
+            </div>
+            {d.userStats.map((u, idx) => {
+              const dt = fmtDateTime(u.lastTs);
+              const isSel = dUser === u.email;
+              return (
+                <div key={u.email} className="grid items-center px-3 py-2 cursor-pointer hover:opacity-80 transition-opacity"
+                  style={{ gridTemplateColumns: "1fr 56px 56px 56px 56px 88px", backgroundColor: idx % 2 === 0 ? BG2 : BG1,
+                           borderTop: "1px solid " + BG3, outline: isSel ? "1px solid " + BRAND + "50" : "none" }}
+                  onClick={() => setDUser(isSel ? "" : u.email)}>
+                  <div className="text-xs truncate pr-2" style={{ color: isSel ? BRAND : "#e5e7eb" }}>{u.email}</div>
+                  <div className="text-xs font-bold text-right" style={{ color: BRAND }}>{u.eventCount}</div>
+                  <div className="text-xs text-gray-400 text-right">{u.pinCount}</div>
+                  <div className="text-xs text-gray-400 text-right">{u.reportCount}</div>
+                  <div className="text-xs text-gray-400 text-right">{u.projectCount}</div>
+                  <div className="text-[10px] text-gray-500 text-right">{dt === "—" ? "—" : dt.ago}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+      {filteredEvs.length > 0 && (
+        <div className="rounded-xl p-5" style={{ backgroundColor: BG1, border: "1px solid " + BRD }}>
+          <div className="text-xs text-gray-500 uppercase tracking-wide font-medium mb-4">
+            Event Log{dCat !== "All" ? ` · ${dCat}` : ""}{dUser ? ` · ${dUser}` : ""} ({filteredEvs.length} shown)
+          </div>
+          <div className="rounded-lg overflow-hidden" style={{ border: "1px solid " + BG3 }}>
+            {filteredEvs.map((ev, idx) => {
+              const dt = fmtDateTime(ev.ts);
+              return (
+                <div key={idx} className="px-4 py-3 flex items-center gap-4"
+                  style={{ backgroundColor: idx % 2 === 0 ? BG2 : BG1, borderTop: idx > 0 ? "1px solid " + BG3 : "none" }}>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm text-gray-200 font-medium">{ev.event}</div>
+                    <div className="text-xs text-gray-500 truncate mt-0.5">{ev.email}</div>
+                  </div>
+                  <div className="text-right flex-shrink-0">
+                    <div className="text-xs font-semibold" style={{ color: BRAND }}>{dt.ago}</div>
+                    <div className="text-[11px] text-gray-500 mt-0.5">{dt.date} · {dt.time}</div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function StatusBadge({ status }) {
   if (status === "In Progress")
     return <span className="text-[11px] px-2 py-0.5 rounded-full font-medium text-black" style={{ backgroundColor: BRAND }}>{status}</span>;
@@ -385,6 +515,7 @@ export default function App() {
   const [todoModal, setTodoModal]           = useState(null);
   const [settingsOpen, setSettingsOpen]     = useState(false);
   const [expandedCard, setExpandedCard]     = useState(null);
+  const [cardFilters, setCardFilters]       = useState({});
   const [editingClients, setEditingClients] = useState(DEFAULT_CLIENTS);
   const [apiUsage, setApiUsage]             = useState(() => getApiUsage());
   const [form, setForm] = useState({ text: "", due: "", priority: "Medium", status: "To Do", notes: "" });
@@ -424,8 +555,8 @@ export default function App() {
         result[c.id] = {
           lastEvent: "Sync error", lastUser: "—", lastDate: null,
           daysAgo: null, eventCount: 0, topEvent: "—", newUsers: 0,
-          pinCount: 0, projectCount: 0, reportCount: 0, signInCount: 0, recentEvents: [],
-          totalProjects: 0, activeProjects: 0, projectsFromId: false,
+          pinCount: 0, reportCount: 0, projectCount: 0, signInCount: 0,
+          recentEvents: [], eventCounts: {}, userStats: [], dataFrom: null, dataTo: null,
         };
       }
     }
@@ -589,69 +720,98 @@ export default function App() {
                     </div>
 
                     <div className="rounded-lg p-3 mb-3" style={{ backgroundColor: BG2 }}>
-                      <div className="text-[10px] text-gray-500 uppercase tracking-wide mb-1.5">
-                        Last Activity{c.daysAgo != null ? " · " + c.daysAgo + "d ago" : ""}
+                      <div className="flex items-center justify-between gap-2 mb-1.5">
+                        <div className="text-[10px] text-gray-500 uppercase tracking-wide">
+                          Last Activity{c.daysAgo != null ? " · " + c.daysAgo + "d ago" : ""}
+                        </div>
+                        {c.dataFrom && <div className="text-[10px] text-gray-600 flex-shrink-0">90d · {fmt(c.dataFrom)} – {fmt(c.dataTo)}</div>}
                       </div>
                       <div className="text-xs text-gray-200 font-medium truncate">{c.lastEvent || (lastSynced ? "No recent activity" : "Not yet synced")}</div>
                       <div className="text-[11px] text-gray-400 mt-0.5 truncate">{c.lastUser || (lastSynced ? "—" : "Hit Sync to load data")}</div>
                     </div>
 
-                    <div className="grid grid-cols-4 gap-1.5 mb-2">
-                      {[
-                        ["Pins",     c.pinCount     ?? "—"],
-                        ["Projects", c.projectCount ?? "—"],
-                        ["Reports",  c.reportCount  ?? "—"],
-                        ["Sign Ins", c.signInCount  ?? "—"],
-                      ].map(([l, v]) => (
-                        <div key={l} className="rounded-lg p-2 text-center" style={{ backgroundColor: BG2 }}>
-                          <div className="text-sm font-bold" style={{ color: BRAND }}>{v}</div>
-                          <div className="text-[10px] text-gray-500 mt-0.5 leading-tight">{l}</div>
-                        </div>
-                      ))}
-                    </div>
-
-                    {(c.totalProjects > 0) && (
-                      <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg mb-2 text-[11px]" style={{ backgroundColor: BG2 }}>
-                        <span className="text-gray-500">Projects (90d):</span>
-                        <span className="font-semibold" style={{ color: BRAND }}>{c.activeProjects}</span>
-                        <span className="text-gray-500">active /</span>
-                        <span className="text-gray-300 font-medium">{c.totalProjects}</span>
-                        <span className="text-gray-500">total</span>
-                        {!c.projectsFromId && <span className="text-gray-700 text-[10px] ml-auto italic">est.</span>}
-                      </div>
-                    )}
-
-                    {(c.recentEvents?.length > 0) && (
-                      <div className="mb-3">
-                        <button
-                          onClick={e => { e.stopPropagation(); setExpandedCard(expandedCard === c.id ? null : c.id); }}
-                          className="w-full flex items-center justify-between px-3 py-1.5 rounded-lg text-[11px] text-gray-400 hover:text-gray-200 transition-colors"
-                          style={{ backgroundColor: BG2 }}>
-                          <span>Recent activity</span>
-                          <span>{expandedCard === c.id ? "▲" : "▼"} {c.recentEvents.length} events</span>
-                        </button>
-                        {expandedCard === c.id && (
-                          <div className="mt-1 rounded-lg overflow-hidden" style={{ border: "1px solid " + BG3 }}>
-                            {c.recentEvents.map((ev, idx) => {
-                              const dt = fmtDateTime(ev.ts);
-                              return (
-                                <div key={idx} className={"px-3 py-2 flex items-start gap-2" + (idx % 2 === 0 ? "" : "")}
-                                  style={{ backgroundColor: idx % 2 === 0 ? BG2 : BG1, borderTop: idx > 0 ? "1px solid " + BG3 : "none" }}>
-                                  <div className="flex-1 min-w-0">
-                                    <div className="text-[11px] text-gray-200 font-medium truncate">{ev.event}</div>
-                                    <div className="text-[10px] text-gray-500 truncate">{ev.email}</div>
-                                  </div>
-                                  <div className="text-right flex-shrink-0">
-                                    <div className="text-[10px] font-medium" style={{ color: BRAND }}>{dt.ago}</div>
-                                    <div className="text-[10px] text-gray-600">{dt.date} · {dt.time}</div>
-                                  </div>
-                                </div>
-                              );
-                            })}
+                    {c.eventCounts && (() => {
+                      const cf     = cardFilters[c.id] || {};
+                      const cat    = cf.cat  || "All";
+                      const user   = cf.user || "";
+                      const catEvs = CAT_EVENTS[cat] || KEY_EVENTS;
+                      const counts = user
+                        ? (c.userStats?.find(u => u.email === user)?.eventCounts || {})
+                        : (c.eventCounts || {});
+                      const maxCt  = Math.max(1, ...catEvs.map(n => counts[n] || 0));
+                      const setCF  = (k, v) => setCardFilters(prev => ({ ...prev, [c.id]: { ...(prev[c.id] || {}), [k]: v } }));
+                      const filteredEvs = (c.recentEvents || [])
+                        .filter(ev => cat === "All" || (CAT_EVENTS[cat] || []).includes(ev.event))
+                        .filter(ev => !user || ev.email === user)
+                        .slice(0, 10);
+                      return (
+                        <>
+                          <div className="flex items-center gap-1 mb-2 flex-wrap">
+                            {["All", "Pins", "Reports", "Projects"].map(cc => (
+                              <button key={cc} onClick={e => { e.stopPropagation(); setCF("cat", cc); }}
+                                className="px-2 py-0.5 rounded-full text-[10px] font-medium transition-colors"
+                                style={cat === cc
+                                  ? { backgroundColor: BRAND, color: "#000" }
+                                  : { backgroundColor: BG3, color: "#6b7280", border: "1px solid #333" }}>
+                                {cc}
+                              </button>
+                            ))}
+                            {c.userStats?.length > 0 && (
+                              <select value={user} onClick={e => e.stopPropagation()}
+                                onChange={e => { e.stopPropagation(); setCF("user", e.target.value); }}
+                                className="ml-auto text-[10px] rounded px-1.5 py-0.5 focus:outline-none cursor-pointer"
+                                style={{ backgroundColor: user ? BRAND + "20" : BG3, color: user ? BRAND : "#6b7280", border: "1px solid " + (user ? BRAND + "40" : "#333") }}>
+                                <option value="">All Users</option>
+                                {c.userStats.map(u => <option key={u.email} value={u.email}>{u.email}</option>)}
+                              </select>
+                            )}
                           </div>
-                        )}
-                      </div>
-                    )}
+                          <div className="space-y-1.5 mb-3">
+                            {catEvs.filter(n => cat !== "All" || (counts[n] || 0) > 0).map(evName => (
+                              <div key={evName} className="flex items-center gap-2">
+                                <span className="text-[10px] text-gray-500 truncate w-24 flex-shrink-0">{evName}</span>
+                                <div className="flex-1 h-1.5 rounded-full overflow-hidden" style={{ backgroundColor: BG3 }}>
+                                  <div className="h-full rounded-full" style={{ width: ((counts[evName] || 0) / maxCt * 100) + "%", backgroundColor: BRAND }} />
+                                </div>
+                                <span className="text-[10px] font-bold w-5 text-right flex-shrink-0" style={{ color: BRAND }}>{counts[evName] || 0}</span>
+                              </div>
+                            ))}
+                            {catEvs.every(n => (counts[n] || 0) === 0) && <div className="text-[10px] text-gray-600 text-center py-1">No activity</div>}
+                          </div>
+                          {filteredEvs.length > 0 && (
+                            <div className="mb-3">
+                              <button
+                                onClick={e => { e.stopPropagation(); setExpandedCard(expandedCard === c.id ? null : c.id); }}
+                                className="w-full flex items-center justify-between px-3 py-1.5 rounded-lg text-[11px] text-gray-400 hover:text-gray-200 transition-colors"
+                                style={{ backgroundColor: BG2 }}>
+                                <span>Recent activity</span>
+                                <span>{expandedCard === c.id ? "▲" : "▼"} {filteredEvs.length} events</span>
+                              </button>
+                              {expandedCard === c.id && (
+                                <div className="mt-1 rounded-lg overflow-hidden" style={{ border: "1px solid " + BG3 }}>
+                                  {filteredEvs.map((ev, idx) => {
+                                    const dt = fmtDateTime(ev.ts);
+                                    return (
+                                      <div key={idx} className="px-3 py-2 flex items-start gap-2"
+                                        style={{ backgroundColor: idx % 2 === 0 ? BG2 : BG1, borderTop: idx > 0 ? "1px solid " + BG3 : "none" }}>
+                                        <div className="flex-1 min-w-0">
+                                          <div className="text-[11px] text-gray-200 font-medium truncate">{ev.event}</div>
+                                          <div className="text-[10px] text-gray-500 truncate">{ev.email}</div>
+                                        </div>
+                                        <div className="text-right flex-shrink-0">
+                                          <div className="text-[10px] font-medium" style={{ color: BRAND }}>{dt.ago}</div>
+                                          <div className="text-[10px] text-gray-600">{dt.date} · {dt.time}</div>
+                                        </div>
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              )}
+                            </div>
+                          )}
+                        </>
+                      );
+                    })()}
 
                     {nextTodo ? (
                       <div className="rounded-lg p-2 text-xs" style={{ backgroundColor: BG2 }}>
@@ -706,74 +866,7 @@ export default function App() {
             ))}
           </div>
 
-          {activeTab === "overview" && (() => {
-            const d = mpData[client.id] || {};
-            return (
-              <div className="space-y-4">
-                <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-                  <div className="rounded-xl p-5" style={{ backgroundColor: BG1, border: "1px solid " + BRD }}>
-                    <div className="text-xs text-gray-500 uppercase tracking-wide font-medium mb-4">Last Activity</div>
-                    <div className="space-y-4">
-                      {[
-                        ["Last Event", d.lastEvent || "—"],
-                        ["By User",    d.lastUser  || "—"],
-                        ["Date",       fmt(d.lastDate)],
-                        ["Top Feature (90d)", d.topEvent || "—"],
-                      ].map(([l, v]) => (
-                        <div key={l}>
-                          <div className="text-gray-500 text-xs mb-0.5">{l}</div>
-                          <div className="text-white font-medium text-sm break-all">{v}</div>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                  <div className="rounded-xl p-5" style={{ backgroundColor: BG1, border: "1px solid " + BRD }}>
-                    <div className="text-xs text-gray-500 uppercase tracking-wide font-medium mb-4">30-Day Metrics</div>
-                    <div className="grid grid-cols-2 gap-3">
-                      {[
-                        ["Pin Drops",    d.pinCount     ?? "—"],
-                        ["Projects",     d.projectCount ?? "—"],
-                        ["Reports",      d.reportCount  ?? "—"],
-                        ["Sign Ins",     d.signInCount  ?? "—"],
-                        ["New Users (MTD)",   d.newUsers   ?? "—"],
-                        ["Days Since Active", d.daysAgo    ?? "—"],
-                      ].map(([l, v]) => (
-                        <div key={l} className="rounded-lg p-3" style={{ backgroundColor: BG2 }}>
-                          <div className="text-2xl font-bold" style={{ color: BRAND }}>{v}</div>
-                          <div className="text-xs text-gray-500 mt-0.5">{l}</div>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                </div>
-
-                {(d.recentEvents?.length > 0) && (
-                  <div className="rounded-xl p-5" style={{ backgroundColor: BG1, border: "1px solid " + BRD }}>
-                    <div className="text-xs text-gray-500 uppercase tracking-wide font-medium mb-4">Recent Events (last {d.recentEvents.length})</div>
-                    <div className="rounded-lg overflow-hidden" style={{ border: "1px solid " + BG3 }}>
-                      {d.recentEvents.map((ev, idx) => {
-                        const dt = fmtDateTime(ev.ts);
-                        return (
-                          <div key={idx} className="px-4 py-3 flex items-center gap-4"
-                            style={{ backgroundColor: idx % 2 === 0 ? BG2 : BG1, borderTop: idx > 0 ? "1px solid " + BG3 : "none" }}>
-                            <div className="flex-1 min-w-0">
-                              <div className="text-sm text-gray-200 font-medium">{ev.event}</div>
-                              <div className="text-xs text-gray-500 truncate mt-0.5">{ev.email}</div>
-                            </div>
-                            <div className="text-right flex-shrink-0">
-                              <div className="text-xs font-semibold" style={{ color: BRAND }}>{dt.ago}</div>
-                              <div className="text-[11px] text-gray-500 mt-0.5">{dt.date}</div>
-                              <div className="text-[11px] text-gray-600">{dt.time}</div>
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
-                )}
-              </div>
-            );
-          })()}
+          {activeTab === "overview" && <DetailOverview d={mpData[client.id] || {}} />}
 
           {activeTab === "todos" && (
             <div>
