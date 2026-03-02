@@ -210,54 +210,32 @@ export default async function handler(req, res) {
         return text;
       }
 
-      // Chunk distinct_ids into batches of 50 to stay within Mixpanel's
-      // expression complexity limit (~50 OR clauses is safe)
-      const BATCH = 50;
-      const ids   = (distinct_ids || []).slice(0, 500).map(id => String(id).replace(/"/g, '\\"'));
-      const chunks = [];
-      for (let i = 0; i < ids.length; i += BATCH) chunks.push(ids.slice(i, i + BATCH));
-      if (ids.length > 500) console.warn("distinct_ids capped at 500 from", distinct_ids.length);
-
-      console.log("Export: running", chunks.length, "batch(es) of up to", BATCH, "IDs");
+      // Fetch all matching events then filter by distinct_ids in JS.
+      // Mixpanel's export `where` clause returns 200 with empty body when
+      // filtering by distinct_id, so client-side filtering is more reliable.
+      const idSet = new Set((distinct_ids || []).map(id => String(id)));
+      console.log("Export: fetching events, will filter to", idSet.size, "distinct_ids client-side");
 
       let allLines = [];
-      if (chunks.length === 0) {
-        try {
-          const text = await runExport("");
-          if (text?.trim()) allLines = text.trim().split("\n").filter(Boolean);
-        } catch (e) {
-          return res.status(500).json({ error: e.message });
-        }
-      } else {
-        for (const chunk of chunks) {
-          // Try both syntaxes — some Mixpanel projects use different JQL dialects
-          const whereV1 = "(" + chunk.map(id => `distinct_id == "${id}"`).join(" or ") + ")";
-          const whereV2 = "(" + chunk.map(id => `properties["distinct_id"] == "${id}"`).join(" or ") + ")";
-          let chunkDone = false;
-          for (const where of [whereV1, whereV2]) {
-            try {
-              const text = await runExport(where);
-              if (text?.trim()) allLines.push(...text.trim().split("\n").filter(Boolean));
-              console.log("Export chunk succeeded with where syntax:", where.slice(0, 60));
-              chunkDone = true;
-              break;
-            } catch (e) {
-              console.warn("Export chunk syntax failed:", where.slice(0, 60), "—", e.message);
-            }
-          }
-          if (!chunkDone) console.error("Export chunk failed with all syntaxes for", chunk.length, "IDs");
-        }
+      try {
+        const text = await runExport("");
+        if (text?.trim()) allLines = text.trim().split("\n").filter(Boolean);
+      } catch (e) {
+        return res.status(500).json({ error: e.message });
       }
 
       const parsed = [];
       let bad = 0;
       for (const l of allLines) {
-        try { parsed.push(JSON.parse(l)); } catch { bad++; }
+        try {
+          const evt = JSON.parse(l);
+          if (idSet.size === 0 || idSet.has(String(evt.properties?.distinct_id))) parsed.push(evt);
+        } catch { bad++; }
       }
       if (bad > 0) console.warn("Export skipped", bad, "unparseable lines");
 
       parsed.sort((a, b) => (b.properties?.time ?? 0) - (a.properties?.time ?? 0));
-      console.log("Export total parsed:", parsed.length, "events from", allLines.length, "lines across", chunks.length || 1, "batch(es)");
+      console.log("Export total parsed:", parsed.length, "matched events from", allLines.length, "total lines");
       return res.status(200).json({ results: parsed });
     }
 
