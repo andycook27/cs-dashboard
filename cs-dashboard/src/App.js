@@ -13,8 +13,15 @@ const BG0 = "#0a0a0a", BG1 = "#111111", BG2 = "#1a1a1a", BG3 = "#2a2a2a", BRD = 
 const CACHE_KEY    = "mp_cache_v3";
 const CLIENTS_KEY  = "cs_clients_v2";
 const API_LOG_KEY  = "mp_api_log_v1";
+const SYNC_LOG_KEY = "mp_sync_log_v1";
 const EXPORT_LIMIT_HR  = 60;
 const ENGAGE_LIMIT_MIN = 5;
+
+const TIER_PROJECTS = {
+  "A la Carte": 1, Lite: 5, Starter: 10, Growth: 20, Builder: 30,
+  Scale: 50, Pro: 75, Business: 100, Enterprise: 150, Premier: 250, Custom: 250,
+};
+const TIERS = Object.keys(TIER_PROJECTS);
 
 // Must exactly match Mixpanel Lexicon event names (case-sensitive, whitespace-sensitive)
 const KEY_EVENTS = [
@@ -35,32 +42,40 @@ const PROJECT_EVENTS = ["Project Created", "User Signed In"];
 const CAT_EVENTS     = { All: KEY_EVENTS, Pins: PIN_EVENTS, Reports: REPORT_EVENTS, Projects: PROJECT_EVENTS };
 
 const DEFAULT_CLIENTS = [
-  { id:  1, name: "Kimley Horn",                domains: ["kimley-horn.com"],         tier: "Enterprise", todos: [] },
-  { id:  2, name: "SiteMarker",                 domains: ["sitemarker.com"],           tier: "Enterprise", todos: [] },
-  { id:  3, name: "Davis & Floyd",              domains: ["davisfloyd.com"],           tier: "Enterprise", todos: [] },
-  { id:  4, name: "K Hovnanian Homes",          domains: ["khov.com"],                tier: "Enterprise", todos: [] },
-  { id:  5, name: "Beaufort Jasper W&S",        domains: ["bjwsa.org"],               tier: "Enterprise", todos: [] },
-  { id:  6, name: "Berkeley County",            domains: ["berkeleycountysc.gov"],     tier: "Enterprise", todos: [] },
-  { id:  7, name: "Development Resource Group", domains: ["drgpllc.com"],             tier: "Enterprise", todos: [] },
-  { id:  8, name: "Thomas & Hutton",            domains: ["tandh.com"],               tier: "Enterprise", todos: [] },
-  { id:  9, name: "Lennar",                     domains: ["lennar.com"],              tier: "Enterprise", todos: [] },
-  { id: 10, name: "SeamonWhiteside",            domains: ["seamonwhiteside.com"],     tier: "Enterprise", todos: [] },
-  { id: 11, name: "MulchNow",                   domains: ["mulchnow.com"],            tier: "Growth",     todos: [] },
-  { id: 12, name: "DesignWorks",                domains: ["dwlc.com"],                tier: "Growth",     todos: [] },
-  { id: 13, name: "Goodwyn Mills Cawood",       domains: ["gmcnetwork.com"],          tier: "Enterprise", todos: [] },
-  { id: 14, name: "Ecosystem Services",         domains: ["ecosystemservices.us"],    tier: "Growth",     todos: [] },
-  { id: 15, name: "Valley Engineering",         domains: ["valleyesp.com"],           tier: "Growth",     todos: [] },
-  { id: 16, name: "Matthews DCCM",             domains: ["dccm.com"],                tier: "Growth",     todos: [] },
-  { id: 17, name: "GCP Saint Gobain",           domains: ["saint-gobain.com"],        tier: "Enterprise", todos: [] },
-  { id: 18, name: "Coleman Company",            domains: ["colemancompanyinc.com"],   tier: "Enterprise", todos: [] },
-  { id: 19, name: "SL Shaw",                    domains: ["slsdev.com"],              tier: "Growth",     todos: [] },
-  { id: 20, name: "Cape Fear Engineering",      domains: ["capefearengineering.com"], tier: "Enterprise", todos: [] },
+  { id:  1, name: "Kimley Horn",                domains: ["kimley-horn.com"],         tier: "Enterprise", freeTrial: false, todos: [] },
+  { id:  2, name: "SiteMarker",                 domains: ["sitemarker.com"],           tier: "Enterprise", freeTrial: false, todos: [] },
+  { id:  3, name: "Davis & Floyd",              domains: ["davisfloyd.com"],           tier: "Enterprise", freeTrial: false, todos: [] },
+  { id:  4, name: "K Hovnanian Homes",          domains: ["khov.com"],                tier: "Enterprise", freeTrial: false, todos: [] },
+  { id:  5, name: "Beaufort Jasper W&S",        domains: ["bjwsa.org"],               tier: "Enterprise", freeTrial: false, todos: [] },
+  { id:  6, name: "Berkeley County",            domains: ["berkeleycountysc.gov"],     tier: "Enterprise", freeTrial: false, todos: [] },
+  { id:  7, name: "Development Resource Group", domains: ["drgpllc.com"],             tier: "Enterprise", freeTrial: false, todos: [] },
+  { id:  8, name: "Thomas & Hutton",            domains: ["tandh.com"],               tier: "Enterprise", freeTrial: false, todos: [] },
+  { id:  9, name: "Lennar",                     domains: ["lennar.com"],              tier: "Enterprise", freeTrial: false, todos: [] },
+  { id: 10, name: "SeamonWhiteside",            domains: ["seamonwhiteside.com"],     tier: "Enterprise", freeTrial: false, todos: [] },
+  { id: 11, name: "MulchNow",                   domains: ["mulchnow.com"],            tier: "Growth",     freeTrial: false, todos: [] },
+  { id: 12, name: "DesignWorks",                domains: ["dwlc.com"],                tier: "Growth",     freeTrial: false, todos: [] },
+  { id: 13, name: "Goodwyn Mills Cawood",       domains: ["gmcnetwork.com"],          tier: "Enterprise", freeTrial: false, todos: [] },
+  { id: 14, name: "Ecosystem Services",         domains: ["ecosystemservices.us"],    tier: "Growth",     freeTrial: false, todos: [] },
+  { id: 15, name: "Valley Engineering",         domains: ["valleyesp.com"],           tier: "Growth",     freeTrial: false, todos: [] },
+  { id: 16, name: "Matthews DCCM",             domains: ["dccm.com"],                tier: "Growth",     freeTrial: false, todos: [] },
+  { id: 17, name: "GCP Saint Gobain",           domains: ["saint-gobain.com"],        tier: "Enterprise", freeTrial: false, todos: [] },
+  { id: 18, name: "Coleman Company",            domains: ["colemancompanyinc.com"],   tier: "Enterprise", freeTrial: false, todos: [] },
+  { id: 19, name: "SL Shaw",                    domains: ["slsdev.com"],              tier: "Growth",     freeTrial: false, todos: [] },
+  { id: 20, name: "Cape Fear Engineering",      domains: ["capefearengineering.com"], tier: "Enterprise", freeTrial: false, todos: [] },
 ];
 
 const TIER_BADGE = {
-  Enterprise: "bg-[#B5DF07]/20 text-[#B5DF07] border border-[#B5DF07]/40",
-  Growth:     "bg-gray-700 text-gray-200 border border-gray-600",
-  Starter:    "bg-gray-800 text-gray-400 border border-gray-700",
+  "A la Carte": "bg-gray-800 text-gray-500 border border-gray-700",
+  Lite:         "bg-gray-800 text-gray-400 border border-gray-700",
+  Starter:      "bg-gray-800 text-gray-400 border border-gray-600",
+  Growth:       "bg-blue-900/40 text-blue-400 border border-blue-700/50",
+  Builder:      "bg-blue-900/40 text-blue-400 border border-blue-700/50",
+  Scale:        "bg-purple-900/40 text-purple-400 border border-purple-700/50",
+  Pro:          "bg-purple-900/40 text-purple-400 border border-purple-700/50",
+  Business:     "bg-[#B5DF07]/15 text-[#B5DF07] border border-[#B5DF07]/30",
+  Enterprise:   "bg-[#B5DF07]/20 text-[#B5DF07] border border-[#B5DF07]/40",
+  Premier:      "bg-[#B5DF07]/25 text-[#B5DF07] border border-[#B5DF07]/55",
+  Custom:       "bg-[#B5DF07]/30 text-[#B5DF07] border border-[#B5DF07]/65",
 };
 
 function getHealth(d) {
@@ -119,6 +134,32 @@ function getApiUsage() {
       engageHr:  log.filter(e => e.endpoint === "engage" && now - e.ts < 3600000).length,
     };
   } catch { return { exportHr: 0, engageMin: 0, engageHr: 0 }; }
+}
+
+// ── Sync timing ───────────────────────────────────────────────────────────────
+function logSyncDuration(ms) {
+  try {
+    const log = JSON.parse(localStorage.getItem(SYNC_LOG_KEY) || "[]");
+    log.push(ms);
+    localStorage.setItem(SYNC_LOG_KEY, JSON.stringify(log.slice(-10)));
+  } catch {}
+}
+function getAvgSyncMs() {
+  try {
+    const log = JSON.parse(localStorage.getItem(SYNC_LOG_KEY) || "[]");
+    if (!log.length) return 0;
+    return Math.round(log.reduce((a, b) => a + b, 0) / log.length);
+  } catch { return 0; }
+}
+function getLimitResetTs() {
+  try {
+    const log = JSON.parse(localStorage.getItem(API_LOG_KEY) || "[]");
+    const now = Date.now();
+    const calls = log.filter(e => e.endpoint === "export" && now - e.ts < 3600000);
+    if (!calls.length) return null;
+    const oldest = calls.reduce((m, e) => e.ts < m ? e.ts : m, calls[0].ts);
+    return oldest + 3600000;
+  } catch { return null; }
 }
 
 // ── Cache ─────────────────────────────────────────────────────────────────────
@@ -518,6 +559,14 @@ export default function App() {
   const [cardFilters, setCardFilters]       = useState({});
   const [editingClients, setEditingClients] = useState(DEFAULT_CLIENTS);
   const [apiUsage, setApiUsage]             = useState(() => getApiUsage());
+  const [syncProgress, setSyncProgress]     = useState(0);
+  const [syncStartTime, setSyncStartTime]   = useState(null);
+  const [syncElapsed, setSyncElapsed]       = useState(0);
+  const [avgSyncMs, setAvgSyncMs]           = useState(() => getAvgSyncMs());
+  const [limitCountdown, setLimitCountdown] = useState("");
+  const [teamMode, setTeamMode]             = useState(() => {
+    try { return localStorage.getItem("mp_team_mode_v1") === "true"; } catch { return false; }
+  });
   const [form, setForm] = useState({ text: "", due: "", priority: "Medium", status: "To Do", notes: "" });
 
   useEffect(() => {
@@ -529,16 +578,71 @@ export default function App() {
     try { localStorage.setItem(CLIENTS_KEY, JSON.stringify(clients)); } catch {}
   }, [clients]);
 
+  // Elapsed sync timer
+  useEffect(() => {
+    if (!loading || !syncStartTime) { setSyncElapsed(0); return; }
+    const iv = setInterval(() => setSyncElapsed(Date.now() - syncStartTime), 500);
+    return () => clearInterval(iv);
+  }, [loading, syncStartTime]);
+
+  // Rate-limit countdown
+  useEffect(() => {
+    const tick = () => {
+      if (apiUsage.exportHr < EXPORT_LIMIT_HR) { setLimitCountdown(""); return; }
+      const reset = getLimitResetTs();
+      if (!reset) { setLimitCountdown(""); return; }
+      const ms = reset - Date.now();
+      if (ms <= 0) { setLimitCountdown(""); setApiUsage(getApiUsage()); return; }
+      const m = Math.floor(ms / 60000);
+      const s = Math.floor((ms % 60000) / 1000);
+      setLimitCountdown(m + ":" + String(s).padStart(2, "0"));
+    };
+    tick();
+    const iv = setInterval(tick, 1000);
+    return () => clearInterval(iv);
+  }, [apiUsage.exportHr]);
+
+  // Team sync polling
+  useEffect(() => {
+    try { localStorage.setItem("mp_team_mode_v1", String(teamMode)); } catch {}
+    if (!teamMode) return;
+    const poll = async () => {
+      try {
+        const res = await fetch("/api/share");
+        if (!res.ok) return;
+        const d = await res.json();
+        if (d?.data && d?.ts) {
+          setLastSynced(prev => {
+            if (!prev || d.ts > prev) {
+              setMpData(d.data);
+              saveCache({ data: d.data, ts: d.ts });
+              return d.ts;
+            }
+            return prev;
+          });
+        }
+      } catch {}
+    };
+    poll();
+    const iv = setInterval(poll, 60000);
+    return () => clearInterval(iv);
+  }, [teamMode]);
+
   const client   = selected !== null ? clients.find(c => c.id === selected) : null;
   const enriched = clients.map(c => ({ ...c, ...(mpData[c.id] || {}) }));
-  const filtered = filter === "All" ? enriched : enriched.filter(c => getHealth(c.daysAgo) === filter);
+  const filtered = filter === "All" ? enriched
+    : filter === "Free Trial" ? enriched.filter(c => c.freeTrial)
+    : enriched.filter(c => getHealth(c.daysAgo) === filter);
 
   const canSync = !loading;
 
   const loadMixpanelData = useCallback(async (clientSubset) => {
     const targetClients = clientSubset || clients;
     if (!canSync) return;
+    const t0 = Date.now();
     setLoading(true);
+    setSyncStartTime(t0);
+    setSyncProgress(0);
     if (!clientSubset) setSyncErrors({});
     const result = { ...mpData };
     const errors = { ...syncErrors };
@@ -559,17 +663,33 @@ export default function App() {
           recentEvents: [], eventCounts: {}, userStats: [], dataFrom: null, dataTo: null,
         };
       }
+      setSyncProgress(prev => prev + 1);
     }
 
     const ts = Date.now();
+    logSyncDuration(ts - t0);
+    const newAvg = getAvgSyncMs();
     setMpData(result);
     if (!clientSubset) setLastSynced(ts);
     setSyncErrors(errors);
     saveCache({ data: result, ts });
     setApiUsage(getApiUsage());
+    setAvgSyncMs(newAvg);
+    setSyncStartTime(null);
+    setSyncProgress(0);
     setLoading(false);
     setLoadingMsg("");
-  }, [clients, canSync, mpData, syncErrors]);
+
+    if (teamMode && !clientSubset) {
+      try {
+        await fetch("/api/share", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ data: result, ts }),
+        });
+      } catch {}
+    }
+  }, [clients, canSync, mpData, syncErrors, teamMode]);
 
   const openAdd  = id => { setForm({ text: "", due: "", priority: "Medium", status: "To Do", notes: "" }); setTodoModal({ clientId: id, todo: null }); };
   const openEdit = (id, todo) => { setForm({ ...todo }); setTodoModal({ clientId: id, todo }); };
@@ -619,16 +739,23 @@ export default function App() {
           </div>
           <div className="flex flex-col items-end gap-2 ml-2">
             <div className="flex gap-2">
-              <button onClick={() => loadMixpanelData()} disabled={!canSync}
+              <button onClick={() => loadMixpanelData()} disabled={!canSync || apiUsage.exportHr >= EXPORT_LIMIT_HR}
                 className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-medium transition-all hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed"
-                style={{ backgroundColor: BRAND, color: "#000" }}>
-                {loading ? <><Spinner /> {loadingMsg || "Syncing..."}</> : "↻ Sync Mixpanel"}
+                style={{ backgroundColor: apiUsage.exportHr >= EXPORT_LIMIT_HR ? "#374151" : BRAND, color: apiUsage.exportHr >= EXPORT_LIMIT_HR ? "#9ca3af" : "#000" }}>
+                {loading ? <><Spinner /> {loadingMsg || "Syncing..."}</> : apiUsage.exportHr >= EXPORT_LIMIT_HR ? "⏱ " + (limitCountdown || "Limit reached") : "↻ Sync Mixpanel"}
               </button>
               <button onClick={() => { setEditingClients(clients); setSettingsOpen(true); }}
                 className="px-3 py-2 rounded-lg text-xs font-medium text-gray-400 hover:text-white transition-colors"
                 style={{ backgroundColor: BG2, border: "1px solid " + BG3 }}>
                 ⚙ Clients
               </button>
+              {teamMode && (
+                <div className="flex items-center gap-1 px-2 py-1 rounded-lg text-[10px]"
+                  style={{ backgroundColor: BRAND + "15", border: "1px solid " + BRAND + "30", color: BRAND }}>
+                  <div className="w-1.5 h-1.5 rounded-full animate-pulse" style={{ backgroundColor: BRAND }} />
+                  Team
+                </div>
+              )}
             </div>
             <div className="flex items-center gap-3 text-[10px]">
               <div className="flex items-center gap-1.5">
@@ -638,7 +765,7 @@ export default function App() {
                     style={{ width: Math.min(100, (apiUsage.exportHr / EXPORT_LIMIT_HR) * 100) + "%",
                              backgroundColor: apiUsage.exportHr >= EXPORT_LIMIT_HR ? "#ef4444" : apiUsage.exportHr > 45 ? "#facc15" : BRAND }} />
                 </div>
-                <span className={apiUsage.exportHr >= EXPORT_LIMIT_HR ? "text-red-400" : "text-gray-500"}>{apiUsage.exportHr}/{EXPORT_LIMIT_HR}/hr</span>
+                <span className={apiUsage.exportHr >= EXPORT_LIMIT_HR ? "text-red-400 font-medium" : "text-gray-500"}>{apiUsage.exportHr}/{EXPORT_LIMIT_HR}/hr{limitCountdown ? " · resets " + limitCountdown : ""}</span>
               </div>
               <div className="flex items-center gap-1.5">
                 <span className="text-gray-600">Engage</span>
@@ -655,11 +782,25 @@ export default function App() {
         </div>
       </div>
 
-      {loading && (
-        <div className="px-6 py-2 text-xs text-center" style={{ backgroundColor: BRAND + "15", borderBottom: "1px solid " + BRAND + "30", color: BRAND }}>
-          {loadingMsg}
-        </div>
-      )}
+      {loading && (() => {
+        const total  = clients.length;
+        const estMs  = avgSyncMs || 0;
+        const pct    = estMs > 0
+          ? Math.min(99, (syncElapsed / estMs) * 100)
+          : Math.min(99, (syncProgress / Math.max(1, total)) * 100);
+        const remSec = estMs > 0 ? Math.max(0, Math.round((estMs - syncElapsed) / 1000)) : null;
+        return (
+          <div className="px-6 py-2.5" style={{ backgroundColor: BRAND + "15", borderBottom: "1px solid " + BRAND + "30" }}>
+            <div className="flex items-center justify-between mb-1.5 text-xs" style={{ color: BRAND }}>
+              <span>{loadingMsg || "Syncing…"}</span>
+              <span>{Math.round(syncElapsed / 1000)}s elapsed{remSec != null ? " · ~" + remSec + "s remaining" : " · " + syncProgress + "/" + total}</span>
+            </div>
+            <div className="w-full h-1.5 rounded-full overflow-hidden" style={{ backgroundColor: BG3 }}>
+              <div className="h-full rounded-full transition-all duration-500" style={{ width: pct + "%", backgroundColor: BRAND }} />
+            </div>
+          </div>
+        );
+      })()}
 
       {Object.keys(syncErrors).length > 0 && !loading && (
         <div className="px-6 py-2 text-xs bg-red-900/20 border-b border-red-800/30">
@@ -680,7 +821,7 @@ export default function App() {
 
       {!client ? (
         <div className="p-6">
-          <div className="flex gap-2 mb-5">
+          <div className="flex gap-2 mb-5 flex-wrap">
             {["All", "Healthy", "At Risk", "Inactive"].map(f => (
               <button key={f} onClick={() => setFilter(f)}
                 className="px-3 py-1.5 rounded-full text-xs font-medium transition-all"
@@ -688,6 +829,15 @@ export default function App() {
                 {f}
               </button>
             ))}
+            {enriched.some(c => c.freeTrial) && (
+              <button onClick={() => setFilter(filter === "Free Trial" ? "All" : "Free Trial")}
+                className="px-3 py-1.5 rounded-full text-xs font-medium transition-all"
+                style={filter === "Free Trial"
+                  ? { backgroundColor: "#fb923c", color: "#000" }
+                  : { backgroundColor: "#431407", color: "#fb923c", border: "1px solid #7c2d12" }}>
+                Free Trial ({enriched.filter(c => c.freeTrial).length})
+              </button>
+            )}
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
@@ -704,9 +854,10 @@ export default function App() {
                   <div className="p-4">
                     <div className="flex items-start justify-between mb-3">
                       <div>
-                        <div className="flex items-center gap-2">
+                        <div className="flex items-center gap-2 flex-wrap">
                           <h2 className="font-semibold text-white text-base group-hover:opacity-80">{c.name}</h2>
-                          <span className={"text-[10px] px-1.5 py-0.5 rounded font-medium " + TIER_BADGE[c.tier]}>{c.tier}</span>
+                          <span className={"text-[10px] px-1.5 py-0.5 rounded font-medium " + (TIER_BADGE[c.tier] || TIER_BADGE.Starter)}>{c.tier}</span>
+                          {c.freeTrial && <span className="text-[10px] px-1.5 py-0.5 rounded font-medium bg-orange-900/40 text-orange-400 border border-orange-700/50">Trial</span>}
                         </div>
                         <div className="flex items-center gap-1.5 mt-1">
                           <div className="w-2 h-2 rounded-full" style={{ backgroundColor: hcol }} />
@@ -962,13 +1113,37 @@ export default function App() {
       {/* Settings Modal */}
       {settingsOpen && (
         <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4">
-          <div className="rounded-2xl w-full max-w-lg p-6 max-h-[80vh] overflow-y-auto" style={{ backgroundColor: BG1, border: "1px solid " + BG3 }}>
-            <h3 className="text-white font-semibold text-lg mb-1">Manage Clients</h3>
-            <p className="text-gray-500 text-xs mb-4">
+          <div className="rounded-2xl w-full max-w-lg p-6 max-h-[85vh] overflow-y-auto" style={{ backgroundColor: BG1, border: "1px solid " + BG3 }}>
+            <h3 className="text-white font-semibold text-lg mb-1">Settings</h3>
+            <p className="text-gray-500 text-xs mb-5">
               Add one or more email domains per client. Type a domain and press{" "}
               <kbd className="px-1 py-0.5 rounded text-gray-400" style={{ backgroundColor: BG3 }}>Enter</kbd> or{" "}
               <kbd className="px-1 py-0.5 rounded text-gray-400" style={{ backgroundColor: BG3 }}>,</kbd> to add it.
             </p>
+
+            {/* Team Mode */}
+            <div className="rounded-lg p-4 mb-5" style={{ backgroundColor: BG2, border: "1px solid " + BG3 }}>
+              <div className="flex items-center justify-between mb-2">
+                <div>
+                  <div className="text-sm text-white font-medium">Team Sync Mode</div>
+                  <div className="text-[11px] text-gray-500 mt-0.5">Share sync data with team members on the same deployment. All tabs sync every 60s.</div>
+                </div>
+                <button onClick={() => setTeamMode(v => !v)}
+                  className="relative w-10 h-5.5 rounded-full transition-colors flex-shrink-0 ml-3"
+                  style={{ backgroundColor: teamMode ? BRAND : BG3, width: "40px", height: "22px" }}>
+                  <span className="absolute top-0.5 transition-all rounded-full bg-white"
+                    style={{ width: "18px", height: "18px", left: teamMode ? "20px" : "2px" }} />
+                </button>
+              </div>
+              {teamMode && (
+                <div className="text-[10px] text-gray-600 mt-1">
+                  Share this URL with your team: <span className="text-gray-400">{window.location.origin}</span>
+                  <span className="ml-1 text-gray-700">(data shared server-side; resets on cold start)</span>
+                </div>
+              )}
+            </div>
+
+            <div className="text-xs text-gray-500 uppercase tracking-wide font-medium mb-3">Clients</div>
             <div className="space-y-3 mb-4">
               {editingClients.map((c, i) => (
                 <div key={c.id} className="rounded-lg p-3" style={{ backgroundColor: BG2 }}>
@@ -980,27 +1155,35 @@ export default function App() {
                         className="w-full rounded px-2 py-1.5 text-xs focus:outline-none" style={inputStyle} />
                     </div>
                     <div>
-                      <label className="text-[10px] text-gray-500 block mb-1">Tier</label>
+                      <label className="text-[10px] text-gray-500 block mb-1">Tier (project pool)</label>
                       <select value={c.tier}
                         onChange={e => setEditingClients(prev => prev.map((x, j) => j === i ? { ...x, tier: e.target.value } : x))}
                         className="w-full rounded px-2 py-1.5 text-xs focus:outline-none" style={inputStyle}>
-                        {["Enterprise", "Growth", "Starter"].map(t => <option key={t} value={t}>{t}</option>)}
+                        {TIERS.map(t => <option key={t} value={t}>{t} ({TIER_PROJECTS[t]} proj)</option>)}
                       </select>
                     </div>
                   </div>
-                  <div>
+                  <div className="mb-2">
                     <label className="text-[10px] text-gray-500 block mb-1">Email Domains</label>
                     <DomainTagInput
                       domains={c.domains || []}
                       onChange={domains => setEditingClients(prev => prev.map((x, j) => j === i ? { ...x, domains } : x))}
                     />
                   </div>
-                  <button onClick={() => setEditingClients(prev => prev.filter((_, j) => j !== i))}
-                    className="text-[10px] text-red-400 hover:text-red-300 mt-2">Remove client</button>
+                  <div className="flex items-center justify-between">
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input type="checkbox" checked={!!c.freeTrial}
+                        onChange={e => setEditingClients(prev => prev.map((x, j) => j === i ? { ...x, freeTrial: e.target.checked } : x))}
+                        className="w-3.5 h-3.5 rounded accent-orange-400" />
+                      <span className="text-[11px] text-orange-400">Free Trial</span>
+                    </label>
+                    <button onClick={() => setEditingClients(prev => prev.filter((_, j) => j !== i))}
+                      className="text-[10px] text-red-400 hover:text-red-300">Remove</button>
+                  </div>
                 </div>
               ))}
             </div>
-            <button onClick={() => setEditingClients(prev => [...prev, { id: Date.now(), name: "", domains: [], tier: "Starter", todos: [] }])}
+            <button onClick={() => setEditingClients(prev => [...prev, { id: Date.now(), name: "", domains: [], tier: "Starter", freeTrial: false, todos: [] }])}
               className="w-full py-2 rounded-lg text-xs font-medium mb-4 text-gray-300 hover:text-white"
               style={{ backgroundColor: BG2, border: "1px solid " + BG3 }}>
               + Add Client
