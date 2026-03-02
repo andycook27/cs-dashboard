@@ -10,9 +10,11 @@ const STATUS_COLORS = {
   "Blocked":     "bg-red-800 text-red-100",
 };
 const BG0 = "#0a0a0a", BG1 = "#111111", BG2 = "#1a1a1a", BG3 = "#2a2a2a", BRD = "#222222";
-const COOLDOWN_MS  = 30 * 60 * 1000;
 const CACHE_KEY    = "mp_cache_v2";
-const CLIENTS_KEY  = "cs_clients_v1";
+const CLIENTS_KEY  = "cs_clients_v2";
+const API_LOG_KEY  = "mp_api_log_v1";
+const EXPORT_LIMIT_HR  = 60;
+const ENGAGE_LIMIT_MIN = 5;
 
 // Must exactly match Mixpanel Lexicon event names (case-sensitive, whitespace-sensitive)
 const KEY_EVENTS = [
@@ -28,8 +30,26 @@ const KEY_EVENTS = [
 ];
 
 const DEFAULT_CLIENTS = [
-  { id: 1, name: "Kimley Horn", domains: ["kimley-horn.com"], tier: "Enterprise", todos: [] },
-  { id: 2, name: "SiteMarker",  domains: ["sitemarker.com"],  tier: "Enterprise", todos: [] },
+  { id:  1, name: "Kimley Horn",                domains: ["kimley-horn.com"],         tier: "Enterprise", todos: [] },
+  { id:  2, name: "SiteMarker",                 domains: ["sitemarker.com"],           tier: "Enterprise", todos: [] },
+  { id:  3, name: "Davis & Floyd",              domains: ["davisfloyd.com"],           tier: "Enterprise", todos: [] },
+  { id:  4, name: "K Hovnanian Homes",          domains: ["khov.com"],                tier: "Enterprise", todos: [] },
+  { id:  5, name: "Beaufort Jasper W&S",        domains: ["bjwsa.org"],               tier: "Enterprise", todos: [] },
+  { id:  6, name: "Berkeley County",            domains: ["berkeleycountysc.gov"],     tier: "Enterprise", todos: [] },
+  { id:  7, name: "Development Resource Group", domains: ["drgpllc.com"],             tier: "Enterprise", todos: [] },
+  { id:  8, name: "Thomas & Hutton",            domains: ["tandh.com"],               tier: "Enterprise", todos: [] },
+  { id:  9, name: "Lennar",                     domains: ["lennar.com"],              tier: "Enterprise", todos: [] },
+  { id: 10, name: "SeamonWhiteside",            domains: ["seamonwhiteside.com"],     tier: "Enterprise", todos: [] },
+  { id: 11, name: "MulchNow",                   domains: ["mulchnow.com"],            tier: "Growth",     todos: [] },
+  { id: 12, name: "DesignWorks",                domains: ["dwlc.com"],                tier: "Growth",     todos: [] },
+  { id: 13, name: "Goodwyn Mills Cawood",       domains: ["gmcnetwork.com"],          tier: "Enterprise", todos: [] },
+  { id: 14, name: "Ecosystem Services",         domains: ["ecosystemservices.us"],    tier: "Growth",     todos: [] },
+  { id: 15, name: "Valley Engineering",         domains: ["valleyesp.com"],           tier: "Growth",     todos: [] },
+  { id: 16, name: "Matthews DCCM",             domains: ["dccm.com"],                tier: "Growth",     todos: [] },
+  { id: 17, name: "GCP Saint Gobain",           domains: ["saint-gobain.com"],        tier: "Enterprise", todos: [] },
+  { id: 18, name: "Coleman Company",            domains: ["colemancompanyinc.com"],   tier: "Enterprise", todos: [] },
+  { id: 19, name: "SL Shaw",                    domains: ["slsdev.com"],              tier: "Growth",     todos: [] },
+  { id: 20, name: "Cape Fear Engineering",      domains: ["capefearengineering.com"], tier: "Enterprise", todos: [] },
 ];
 
 const TIER_BADGE = {
@@ -76,6 +96,26 @@ function timeAgo(ts) {
   return Math.floor(hrs / 24) + "d ago";
 }
 
+// ── API call tracking ─────────────────────────────────────────────────────────
+function logApiCall(endpoint) {
+  try {
+    const log = JSON.parse(localStorage.getItem(API_LOG_KEY) || "[]");
+    log.push({ endpoint, ts: Date.now() });
+    localStorage.setItem(API_LOG_KEY, JSON.stringify(log.filter(e => e.ts > Date.now() - 7200000)));
+  } catch {}
+}
+function getApiUsage() {
+  try {
+    const log = JSON.parse(localStorage.getItem(API_LOG_KEY) || "[]");
+    const now = Date.now();
+    return {
+      exportHr:  log.filter(e => e.endpoint === "export" && now - e.ts < 3600000).length,
+      engageMin: log.filter(e => e.endpoint === "engage" && now - e.ts <   60000).length,
+      engageHr:  log.filter(e => e.endpoint === "engage" && now - e.ts < 3600000).length,
+    };
+  } catch { return { exportHr: 0, engageMin: 0, engageHr: 0 }; }
+}
+
 // ── Cache ─────────────────────────────────────────────────────────────────────
 let memCache = null;
 function loadCache() {
@@ -96,6 +136,7 @@ function saveCache(data) {
 
 // ── API proxy call ────────────────────────────────────────────────────────────
 async function mpCall(endpoint, params) {
+  logApiCall(endpoint);
   console.log("mpCall →", endpoint, JSON.stringify(params).slice(0, 200));
 
   let res;
@@ -147,6 +188,7 @@ async function fetchDomainData(domains) {
       lastEvent: "No users found", lastUser: "—", lastDate: null,
       daysAgo: null, eventCount: 0, topEvent: "—", newUsers: 0,
       pinCount: 0, projectCount: 0, reportCount: 0, signInCount: 0, recentEvents: [],
+      totalProjects: 0, activeProjects: 0, projectsFromId: false,
     };
   }
 
@@ -248,8 +290,25 @@ async function fetchDomainData(domains) {
     ts:    e.properties.time * 1000,
   }));
 
+  // ── Project counts ─────────────────────────────────────────────────────────
+  const PROJECT_ID_KEYS = ["project_id", "projectId", "$project_id", "Project ID", "projectID"];
+  const allProjIds = new Set(), activeProjIds = new Set();
+  events.forEach(e => {
+    const props = e.properties || {};
+    let pid = null;
+    for (const k of PROJECT_ID_KEYS) { if (props[k]) { pid = String(props[k]); break; } }
+    if (pid) {
+      allProjIds.add(pid);
+      if (e.properties.time * 1000 >= from30ts) activeProjIds.add(pid);
+    }
+  });
+  const projectsFromId = allProjIds.size > 0;
+  const totalProjects  = allProjIds.size  || events.filter(e => e.event === "Project Created").length;
+  const activeProjects = activeProjIds.size || recent.filter(e => e.event === "Project Created").length;
+
   return { lastEvent, lastUser, lastDate, daysAgo, eventCount, topEvent, newUsers,
-           pinCount, projectCount, reportCount, signInCount, recentEvents };
+           pinCount, projectCount, reportCount, signInCount, recentEvents,
+           totalProjects, activeProjects, projectsFromId };
 }
 
 // ── Components ────────────────────────────────────────────────────────────────
@@ -327,6 +386,7 @@ export default function App() {
   const [settingsOpen, setSettingsOpen]     = useState(false);
   const [expandedCard, setExpandedCard]     = useState(null);
   const [editingClients, setEditingClients] = useState(DEFAULT_CLIENTS);
+  const [apiUsage, setApiUsage]             = useState(() => getApiUsage());
   const [form, setForm] = useState({ text: "", due: "", priority: "Medium", status: "To Do", notes: "" });
 
   useEffect(() => {
@@ -342,12 +402,11 @@ export default function App() {
   const enriched = clients.map(c => ({ ...c, ...(mpData[c.id] || {}) }));
   const filtered = filter === "All" ? enriched : enriched.filter(c => getHealth(c.daysAgo) === filter);
 
-  const canSync      = !loading && (!lastSynced || Date.now() - lastSynced > COOLDOWN_MS);
-  const cooldownMins = lastSynced ? Math.max(0, Math.ceil((COOLDOWN_MS - (Date.now() - lastSynced)) / 60000)) : 0;
+  const canSync = !loading;
 
   const loadMixpanelData = useCallback(async (clientSubset) => {
     const targetClients = clientSubset || clients;
-    if (!clientSubset && !canSync) return;
+    if (!canSync) return;
     setLoading(true);
     if (!clientSubset) setSyncErrors({});
     const result = { ...mpData };
@@ -366,6 +425,7 @@ export default function App() {
           lastEvent: "Sync error", lastUser: "—", lastDate: null,
           daysAgo: null, eventCount: 0, topEvent: "—", newUsers: 0,
           pinCount: 0, projectCount: 0, reportCount: 0, signInCount: 0, recentEvents: [],
+          totalProjects: 0, activeProjects: 0, projectsFromId: false,
         };
       }
     }
@@ -375,6 +435,7 @@ export default function App() {
     if (!clientSubset) setLastSynced(ts);
     setSyncErrors(errors);
     saveCache({ data: result, ts });
+    setApiUsage(getApiUsage());
     setLoading(false);
     setLoadingMsg("");
   }, [clients, canSync, mpData, syncErrors]);
@@ -425,7 +486,7 @@ export default function App() {
               </div>
             ))}
           </div>
-          <div className="flex flex-col items-end gap-1 ml-2">
+          <div className="flex flex-col items-end gap-2 ml-2">
             <div className="flex gap-2">
               <button onClick={() => loadMixpanelData()} disabled={!canSync}
                 className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-medium transition-all hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed"
@@ -438,12 +499,27 @@ export default function App() {
                 ⚙ Clients
               </button>
             </div>
-            {lastSynced && (
-              <p className="text-[10px] text-gray-600">
-                Last synced {timeAgo(lastSynced)}
-                {!canSync && cooldownMins > 0 && <span className="text-gray-700"> · next sync in {cooldownMins}m</span>}
-              </p>
-            )}
+            <div className="flex items-center gap-3 text-[10px]">
+              <div className="flex items-center gap-1.5">
+                <span className="text-gray-600">Export</span>
+                <div className="w-16 h-1.5 rounded-full overflow-hidden" style={{ backgroundColor: BG3 }}>
+                  <div className="h-full rounded-full transition-all"
+                    style={{ width: Math.min(100, (apiUsage.exportHr / EXPORT_LIMIT_HR) * 100) + "%",
+                             backgroundColor: apiUsage.exportHr >= EXPORT_LIMIT_HR ? "#ef4444" : apiUsage.exportHr > 45 ? "#facc15" : BRAND }} />
+                </div>
+                <span className={apiUsage.exportHr >= EXPORT_LIMIT_HR ? "text-red-400" : "text-gray-500"}>{apiUsage.exportHr}/{EXPORT_LIMIT_HR}/hr</span>
+              </div>
+              <div className="flex items-center gap-1.5">
+                <span className="text-gray-600">Engage</span>
+                <div className="w-16 h-1.5 rounded-full overflow-hidden" style={{ backgroundColor: BG3 }}>
+                  <div className="h-full rounded-full transition-all"
+                    style={{ width: Math.min(100, (apiUsage.engageMin / ENGAGE_LIMIT_MIN) * 100) + "%",
+                             backgroundColor: apiUsage.engageMin >= ENGAGE_LIMIT_MIN ? "#ef4444" : apiUsage.engageMin >= 4 ? "#facc15" : BRAND }} />
+                </div>
+                <span className={apiUsage.engageMin >= ENGAGE_LIMIT_MIN ? "text-red-400" : "text-gray-500"}>{apiUsage.engageMin}/{ENGAGE_LIMIT_MIN}/min · {apiUsage.engageHr}/hr</span>
+              </div>
+              {lastSynced && <span className="text-gray-700">· {timeAgo(lastSynced)}</span>}
+            </div>
           </div>
         </div>
       </div>
@@ -520,7 +596,7 @@ export default function App() {
                       <div className="text-[11px] text-gray-400 mt-0.5 truncate">{c.lastUser || (lastSynced ? "—" : "Hit Sync to load data")}</div>
                     </div>
 
-                    <div className="grid grid-cols-4 gap-1.5 mb-3">
+                    <div className="grid grid-cols-4 gap-1.5 mb-2">
                       {[
                         ["Pins",     c.pinCount     ?? "—"],
                         ["Projects", c.projectCount ?? "—"],
@@ -533,6 +609,17 @@ export default function App() {
                         </div>
                       ))}
                     </div>
+
+                    {(c.totalProjects > 0) && (
+                      <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg mb-2 text-[11px]" style={{ backgroundColor: BG2 }}>
+                        <span className="text-gray-500">Projects (90d):</span>
+                        <span className="font-semibold" style={{ color: BRAND }}>{c.activeProjects}</span>
+                        <span className="text-gray-500">active /</span>
+                        <span className="text-gray-300 font-medium">{c.totalProjects}</span>
+                        <span className="text-gray-500">total</span>
+                        {!c.projectsFromId && <span className="text-gray-700 text-[10px] ml-auto italic">est.</span>}
+                      </div>
+                    )}
 
                     {(c.recentEvents?.length > 0) && (
                       <div className="mb-3">
