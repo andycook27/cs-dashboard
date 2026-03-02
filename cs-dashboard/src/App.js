@@ -139,7 +139,8 @@ async function fetchDomainData(domains) {
   }).length;
 
   // Step 2: Export → events
-  const to90   = new Date().toISOString().slice(0, 10);
+  // Mixpanel Export requires to_date to be strictly before today
+  const to90   = new Date(Date.now() - 86400000).toISOString().slice(0, 10); // yesterday
   const from90 = new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10);
   console.log("[fetchDomainData] Export", from90, "→", to90, "for", distinctIds.length, "users");
 
