@@ -220,25 +220,6 @@ export default async function handler(req, res) {
 
       console.log("Export: running", chunks.length, "batch(es) of up to", BATCH, "IDs");
 
-      // First: try a no-where probe request to confirm base Export works at all
-      // This eliminates auth/date/event issues from where-clause issues
-      try {
-        const probeParams = { from_date, to_date, project_id: projectId };
-        if (eventStr) probeParams.event = eventStr;
-        const probeR = await mpFetch("https://data.mixpanel.com/api/2.0/export", {
-          method:  "POST",
-          headers: { ...headers, "Content-Type": "application/x-www-form-urlencoded", Accept: "text/plain" },
-          body:    new URLSearchParams(probeParams).toString(),
-        });
-        const probeText = await probeR.text();
-        console.log("Export probe (no where) status:", probeR.status, "| preview:", probeText.slice(0, 200));
-        if (!probeR.ok) {
-          return res.status(probeR.status).json({ error: "Export failed even without where clause", body: probeText.slice(0, 500) });
-        }
-      } catch (e) {
-        return res.status(500).json({ error: "Export probe failed: " + e.message });
-      }
-
       let allLines = [];
       if (chunks.length === 0) {
         try {
